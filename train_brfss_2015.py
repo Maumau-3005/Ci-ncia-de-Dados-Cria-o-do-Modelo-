@@ -66,6 +66,30 @@ warnings.simplefilter("ignore")
 RANDOM_STATE = 42
 
 
+# Lista de colunas selecionadas manualmente para o treinamento
+SELECTED_FEATURES = [
+    "_AGE_G",
+    "EDUCA",
+    "MARITAL",
+    "INCOME2",
+    "GENHLTH",
+    "MENTHLTH",
+    "PHYSHLTH",
+    "EXERANY2",
+    "_RFDRHV5",
+    "SEX",
+    "CHILDREN",
+    "HLTHPLN1",
+    "_TOTINDA",
+    "DIABETE3",
+    "ASTHMA3",
+    "_SMOKER3",
+]
+
+# Subconjunto tratado como numérico contínuo dentro das features selecionadas
+NUMERIC_SELECTED = {"MENTHLTH", "PHYSHLTH", "CHILDREN"}
+
+
 # ==========================
 # Funções auxiliares
 # ==========================
@@ -197,6 +221,35 @@ def apply_missing_map(df: pd.DataFrame, missing_map: Dict[str, Set[Any]]) -> pd.
     return df
 
 
+def apply_manual_cleaning(df: pd.DataFrame) -> pd.DataFrame:
+    """Aplica a limpeza manual informada pelo usuário às colunas relevantes."""
+
+    replacements: Dict[str, Dict[Any, Any]] = {
+        "_RFDRHV5": {9: np.nan, 1: 0.0, 2: 1.0},
+        "_SMOKER3": {9: np.nan},
+        "GENHLTH": {9: np.nan, 7: np.nan},
+        "PHYSHLTH": {99: np.nan, 77: np.nan, 88: 0.0},
+        "MENTHLTH": {99: np.nan, 77: np.nan, 88: 0.0},
+        "CHILDREN": {88: 0.0, 99: np.nan},
+        "INCOME2": {99: np.nan, 77: 0.0},
+        "EDUCA": {9: np.nan},
+        "HLTHPLN1": {9: np.nan, 7: np.nan, 1: 0.0, 2: 1.0},
+        "MARITAL": {9: np.nan},
+        "_TOTINDA": {9: np.nan},
+        "DIABETE3": {9: np.nan, 7: np.nan},
+        "ASTHMA3": {9: np.nan, 7: np.nan},
+    }
+
+    # Trabalhar sobre uma cópia para não alterar o DataFrame original inadvertidamente
+    df_clean = df.copy()
+
+    for col, mapping in replacements.items():
+        if col in df_clean.columns:
+            df_clean[col] = df_clean[col].replace(mapping)
+
+    return df_clean
+
+
 def derive_targets(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, List[str]]:
     """
     Constrói os dois alvos: binge e fumante atual.
@@ -254,66 +307,29 @@ def derive_targets(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, List[str]]:
 
 
 def select_features(df: pd.DataFrame, leakage_cols: List[str]) -> Tuple[List[str], List[str]]:
-    """
-    Seleciona colunas de interesse e separa em categóricas e numéricas.
-    - Preferências e substituições pedidas:
-        * Idade: preferir "_AGE_G" (grupos) se existir; caso contrário, usar "_AGE80".
-        * Atividade física: preferir "EXERANY2" (sim/não) se existir; senão usar "EXEROFT1" (frequência).
-        * Incluir (se existirem): "_RFDRHV5" (alto consumo), "CHILDREN", "ASTHMA3".
-        * Manter: "SEX", "EDUCA", "MARITAL", "INCOME2", "GENHLTH", "MENTHLTH", "PHYSHLTH",
-                  "_TOTINDA", "BPMEDS", "BPHIGH4", "DIABETE3", "DIABAGE2", "CHOLCHK",
-                  "HLTHPLN1", "PERSDOC2".
-        * Não usar como feature: identificadores (p.ex. "SEQNO") e variáveis usadas diretamente
-          para construir os alvos ("_RFBING5", "DRNK3GE5", "_SMOKER3", "SMOKDAY2").
-    Remove colunas de leakage se existirem no conjunto de features.
-    """
+    """Seleciona as colunas definidas manualmente e separa tipos para o pipeline."""
 
-    # Resolver escolhas preferenciais por disponibilidade no dataset
-    age_pref = "_AGE_G" if "_AGE_G" in df.columns else ("_AGE80" if "_AGE80" in df.columns else None)
-    exercise_pref = (
-        "EXERANY2" if "EXERANY2" in df.columns else ("EXEROFT1" if "EXEROFT1" in df.columns else None)
-    )
+    available = [c for c in SELECTED_FEATURES if c in df.columns]
 
-    base_candidates = [
-        age_pref,
-        "SEX",
-        "EDUCA",
-        "MARITAL",
-        "INCOME2",
-        "GENHLTH",
-        "MENTHLTH",
-        "PHYSHLTH",
-        "_TOTINDA",
-        exercise_pref,
-        "BPMEDS",
-        "BPHIGH4",
-        "DIABETE3",
-        "DIABAGE2",
-        "CHOLCHK",
-        "HLTHPLN1",
-        "PERSDOC2",
-        # Novas candidatas sugeridas (se existirem no dataset local)
-        "_RFDRHV5",
-        "CHILDREN",
-        "ASTHMA3",
-    ]
+    missing = [c for c in SELECTED_FEATURES if c not in df.columns]
+    if missing:
+        warnings.warn(
+            "As seguintes colunas selecionadas não estão presentes no dataset e serão ignoradas: "
+            + ", ".join(missing)
+        )
 
-    # Filtrar None e manter apenas as colunas existentes
-    features = [c for c in base_candidates if c is not None and c in df.columns]
+    features = available.copy()
 
     # Remover potenciais vazamentos (colunas usadas na derivação do alvo corrente)
     for leak in leakage_cols:
         if leak in features:
             features.remove(leak)
 
-    # Definir quais tratar como numéricas contínuas
-    numeric_preferred = {"MENTHLTH", "PHYSHLTH", "DIABAGE2", "EXEROFT1", "CHILDREN"}
-
     cat_cols: List[str] = []
     num_cols: List[str] = []
 
     for c in features:
-        if c in numeric_preferred:
+        if c in NUMERIC_SELECTED:
             num_cols.append(c)
         else:
             # Demais tratadas como categóricas (incluindo codificadas numericamente)
@@ -611,6 +627,9 @@ def main() -> None:
     log("Carregando dataset BRFSS 2015…")
     csv_path = os.path.join("data", "2015.csv")
     df = read_dataset(csv_path)
+
+    log("Aplicando limpeza manual nas colunas selecionadas…")
+    df = apply_manual_cleaning(df)
 
     # Ler metadados e construir mapa de ausentes
     log("Lendo 2015_formats.json (se disponível) para mapear códigos ausentes por coluna…")
