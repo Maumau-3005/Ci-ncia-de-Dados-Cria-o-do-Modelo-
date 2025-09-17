@@ -222,8 +222,8 @@ def apply_missing_map(df: pd.DataFrame, missing_map: Dict[str, Set[Any]]) -> pd.
 
 
 def apply_manual_cleaning(df: pd.DataFrame) -> pd.DataFrame:
-    """Aplica a limpeza manual informada pelo usuário às colunas relevantes."""
 
+#Limpeza manual conforme análise dos metadados e PDF
     replacements: Dict[str, Dict[Any, Any]] = {
         "_RFDRHV5": {9: np.nan, 1: 0.0, 2: 1.0},
         "_SMOKER3": {9: np.nan},
