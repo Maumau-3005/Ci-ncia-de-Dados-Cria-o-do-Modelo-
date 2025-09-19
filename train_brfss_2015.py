@@ -34,22 +34,6 @@ from sklearn import linear_model
 from sklearn import ensemble
 from sklearn.pipeline import Pipeline
 
-# Tentar importar pacotes opcionais
-_HAS_XGB = False
-_HAS_LGBM = False
-try:
-    from xgboost import XGBClassifier  # type: ignore
-    _HAS_XGB = True
-except Exception:
-    _HAS_XGB = False
-
-try:
-    from lightgbm import LGBMClassifier  # type: ignore
-    _HAS_LGBM = True
-except Exception:
-    _HAS_LGBM = False
-
-
 # ==========================
 # Utilitário de logging
 # ==========================
@@ -225,7 +209,7 @@ def apply_manual_cleaning(df: pd.DataFrame) -> pd.DataFrame:
 
 #Limpeza manual conforme análise dos metadados e PDF
     replacements: Dict[str, Dict[Any, Any]] = {
-        "_RFDRHV5": {9: np.nan, 1: 0.0, 2: 1.0},
+        "_RFDRHV5": {9: np.nan},
         "_SMOKER3": {9: np.nan},
         "GENHLTH": {9: np.nan, 7: np.nan},
         "PHYSHLTH": {99: np.nan, 77: np.nan, 88: 0.0},
@@ -252,56 +236,39 @@ def apply_manual_cleaning(df: pd.DataFrame) -> pd.DataFrame:
 
 def derive_targets(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, List[str]]:
     """
-    Constrói os dois alvos: binge e fumante atual.
+    Constrói os dois alvos a partir das colunas já presentes no dataset reduzido.
 
-    - Binge (binário):
-        Preferir _RFBING5 se existir (mapear 2->1, 1->0, outros->NaN). Caso contrário,
-        derivar de DRNK3GE5: valores válidos > 0 nos últimos 30 dias => 1; 0/"none" => 0;
-        não resposta => NaN (já tratados por missing_map).
+    - Binge (binário) usa `_RFDRHV5`, onde 2 representa consumo excessivo e 1,
+      não consumo. O valor é transformado para 1.0/0.0 e outros códigos viram NaN.
+    - Fumante atual (binário) usa `_SMOKER3`: códigos 1/2 => 1.0 (fumantes),
+      códigos 3/4 => 0.0 (não fumantes); demais => NaN.
 
-    - Fumante atual (binário):
-        Preferir _SMOKER3: 1/2 => 1; 3/4 => 0; demais => NaN. Se ausente, SMOKDAY2 com
-        mapeamento 1/2 => 1; 3 => 0; demais => NaN.
-
-    Retorna (y_binge, y_smoke, leakage_cols) – leakage_cols devem ser removidas das features.
+    Retorna (y_binge, y_smoke, leakage_cols) – leakage_cols devem ser removidas
+    das features para evitar vazamentos.
     """
+    for required in ["_RFDRHV5", "_SMOKER3"]:
+        if required not in df.columns:
+            raise ValueError(
+                f"Não foi possível construir os alvos: coluna obrigatória {required} ausente."
+            )
+
     leakage_cols: List[str] = []
 
-    # Binge
-    if "_RFBING5" in df.columns:
-        leakage_cols.append("_RFBING5")
-        s = df["_RFBING5"]
-        y_binge = pd.Series(np.where(s == 2, 1.0, np.where(s == 1, 0.0, np.nan)), index=s.index)
-    elif "DRNK3GE5" in df.columns:
-        leakage_cols.append("DRNK3GE5")
-        s = df["DRNK3GE5"].copy()
-        # Tratar possíveis strings 'none'
-        s = s.replace({"none": 0, "None": 0, "NONE": 0})
-        s_num = pd.to_numeric(s, errors="coerce")
-        y_binge = (s_num.notna() & (s_num > 0)).astype(float)
-        # Valores 0 (ou 'none' convertido) => 0.0; NaNs já tratados
-    else:
-        raise ValueError(
-            "Não foi possível construir o alvo Binge: faltam colunas _RFBING5 e DRNK3GE5."
+    s_binge = pd.to_numeric(df["_RFDRHV5"], errors="coerce")
+    if not s_binge.dropna().isin({0.0, 1.0}).all():
+        s_binge = pd.Series(
+            np.where(s_binge == 1, 1.0, np.where(s_binge == 2, 0.0, np.nan)),
+            index=s_binge.index,
         )
+    y_binge = s_binge.astype(float)
+    leakage_cols.append("_RFDRHV5")
 
-    # Fumante atual
-    if "_SMOKER3" in df.columns:
-        leakage_cols.append("_SMOKER3")
-        s = df["_SMOKER3"]
-        y_smoke = pd.Series(
-            np.where(s.isin([1, 2]), 1.0, np.where(s.isin([3, 4]), 0.0, np.nan)), index=s.index
-        )
-    elif "SMOKDAY2" in df.columns:
-        leakage_cols.append("SMOKDAY2")
-        s = df["SMOKDAY2"]
-        y_smoke = pd.Series(
-            np.where(s.isin([1, 2]), 1.0, np.where(s == 3, 0.0, np.nan)), index=s.index
-        )
-    else:
-        raise ValueError(
-            "Não foi possível construir o alvo Fumante atual: faltam colunas _SMOKER3 e SMOKDAY2."
-        )
+    s_smoke = pd.to_numeric(df["_SMOKER3"], errors="coerce")
+    y_smoke = pd.Series(
+        np.where(s_smoke.isin([1, 2]), 1.0, np.where(s_smoke.isin([3, 4]), 0.0, np.nan)),
+        index=s_smoke.index,
+    )
+    leakage_cols.append("_SMOKER3")
 
     return y_binge, y_smoke, leakage_cols
 
@@ -370,7 +337,7 @@ def build_preprocess(cat_cols: List[str], num_cols: List[str]) -> compose.Column
 
 
 def get_models() -> Dict[str, Any]:
-    models: Dict[str, Any] = {
+    return {
         "LogReg": linear_model.LogisticRegression(
             max_iter=200, class_weight="balanced", solver="liblinear", random_state=RANDOM_STATE
         ),
@@ -382,38 +349,6 @@ def get_models() -> Dict[str, Any]:
         ),
         "GB": ensemble.GradientBoostingClassifier(random_state=RANDOM_STATE),
     }
-
-    if _HAS_XGB:
-        try:
-            models["XGB"] = XGBClassifier(
-                n_estimators=300,
-                max_depth=6,
-                learning_rate=0.1,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=RANDOM_STATE,
-                eval_metric="logloss",
-                tree_method="hist",
-                n_jobs=-1,
-            )
-        except Exception:
-            pass
-
-    if _HAS_LGBM:
-        try:
-            models["LGBM"] = LGBMClassifier(
-                n_estimators=400,
-                num_leaves=31,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=RANDOM_STATE,
-                n_jobs=-1,
-            )
-        except Exception:
-            pass
-
-    return models
 
 
 def _proba_or_score(clf, X) -> np.ndarray:
@@ -449,97 +384,6 @@ def evaluate_model(clf, X_val, y_val, X_test, y_test) -> Tuple[float, float, flo
     return val_acc, test_acc, test_auc
 
 
-def _compute_scale_pos_weight(y: pd.Series) -> float:
-    try:
-        pos = int((y == 1).sum())
-        neg = int((y == 0).sum())
-        if pos == 0:
-            return 1.0
-        return max(1.0, neg / max(1, pos))
-    except Exception:
-        return 1.0
-
-
-def tune_and_evaluate(
-    name: str,
-    base_pipe: Pipeline,
-    X_train,
-    y_train,
-    X_val,
-    y_val,
-    X_train_val,
-    y_train_val,
-    X_test,
-    y_test,
-) -> Tuple[Pipeline, float, float, float]:
-    """
-    Faz busca de hiperparâmetros para XGB/LGBM no conjunto de treino (com CV),
-    avalia no holdout de validação para referência e refita em train+val para
-    avaliar no teste final.
-    """
-    assert name in {"XGB", "LGBM"}
-
-    spw = _compute_scale_pos_weight(pd.Series(y_train))
-
-    if name == "XGB":
-        # Espaço de busca XGBoost — focado em controlar overfitting/complexidade
-        param_distributions = {
-            "clf__n_estimators": [200, 300, 400, 600, 800],
-            "clf__max_depth": [3, 4, 5, 6, 8, 10],
-            "clf__min_child_weight": [1, 2, 3, 5, 7, 10],
-            "clf__subsample": [0.6, 0.7, 0.8, 0.9, 1.0],
-            "clf__colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],
-            "clf__gamma": [0, 0.5, 1, 2],
-            "clf__reg_alpha": [0.0, 0.1, 0.5, 1.0, 2.0],
-            "clf__reg_lambda": [0.0, 0.5, 1.0, 2.0, 5.0, 10.0],
-            "clf__learning_rate": [0.01, 0.05, 0.1, 0.2],
-            "clf__scale_pos_weight": [1.0, spw, max(1.0, np.sqrt(spw))],
-        }
-        n_iter = 20
-    else:  # LGBM
-        param_distributions = {
-            "clf__n_estimators": [300, 400, 600, 800, 1000],
-            "clf__num_leaves": [15, 31, 63, 127],
-            "clf__max_depth": [-1, 4, 6, 8, 12],
-            "clf__min_child_samples": [5, 10, 20, 30, 50],
-            "clf__subsample": [0.6, 0.7, 0.8, 0.9, 1.0],
-            "clf__colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],
-            "clf__reg_alpha": [0.0, 0.1, 0.5, 1.0, 2.0],
-            "clf__reg_lambda": [0.0, 0.5, 1.0, 2.0, 5.0, 10.0],
-            "clf__learning_rate": [0.01, 0.05, 0.1, 0.2],
-            "clf__min_split_gain": [0.0, 0.1, 0.5, 1.0],
-        }
-        n_iter = 20
-
-    search = skms.RandomizedSearchCV(
-        base_pipe,
-        param_distributions=param_distributions,
-        n_iter=n_iter,
-        scoring="accuracy",
-        n_jobs=-1,
-        cv=3,
-        refit=False,
-        random_state=RANDOM_STATE,
-        verbose=0,
-    )
-
-    # Busca em X_train (sem usar validação)
-    search.fit(X_train, y_train)
-
-    # Construir pipeline final com melhores hiperparâmetros
-    best_params = search.best_params_
-    tuned_pipe: Pipeline = Pipeline(steps=[("prep", base_pipe.named_steps["prep"]), ("clf", base_pipe.named_steps["clf"])])
-    tuned_pipe.set_params(**best_params)
-
-    # 1) Métrica de validação (fit em X_train, pred em X_val)
-    tuned_pipe.fit(X_train, y_train)
-    val_acc, _, _ = evaluate_model(tuned_pipe, X_val, y_val, X_val, y_val)
-
-    # 2) Refit em train+val para avaliação final de teste
-    tuned_pipe.fit(X_train_val, y_train_val)
-    _, test_acc, test_auc = evaluate_model(tuned_pipe, X_val, y_val, X_test, y_test)
-
-    return tuned_pipe, float(val_acc), float(test_acc), float(test_auc)
 
 
 def fit_and_evaluate(
@@ -586,20 +430,8 @@ def fit_and_evaluate(
     for name, model in models.items():
         pipe = Pipeline(steps=[("prep", preprocess), ("clf", model)])
 
-        # Tunar XGB/LGBM conforme solicitado; manter demais como antes
-        if name in {"XGB", "LGBM"}:
-            try:
-                tuned_pipe, val_acc, test_acc, test_auc = tune_and_evaluate(
-                    name, pipe, X_train, y_train, X_val, y_val, X_train_val, y_train_val, X_test, y_test
-                )
-                pipe = tuned_pipe
-            except Exception as e:
-                print(f"[Aviso] Falha ao tunar {name}: {e}. Usando parâmetros padrão.")
-                pipe.fit(X_train, y_train)
-                val_acc, test_acc, test_auc = evaluate_model(pipe, X_val, y_val, X_test, y_test)
-        else:
-            pipe.fit(X_train, y_train)
-            val_acc, test_acc, test_auc = evaluate_model(pipe, X_val, y_val, X_test, y_test)
+        pipe.fit(X_train, y_train)
+        val_acc, test_acc, test_auc = evaluate_model(pipe, X_val, y_val, X_test, y_test)
 
         results[name] = {
             "val_acc": float(val_acc),
@@ -626,7 +458,18 @@ def main() -> None:
     # Carregar dados
     log("Carregando dataset BRFSS 2015…")
     csv_path = os.path.join("data", "2015.csv")
+    required_cols = sorted(set(SELECTED_FEATURES + ["_RFDRHV5", "_SMOKER3"]))
     df = read_dataset(csv_path)
+
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(
+            "O dataset não contém as colunas necessárias para o treinamento: "
+            + ", ".join(missing_cols)
+        )
+
+    # Garantir que somente as colunas necessárias sejam utilizadas
+    df = df.loc[:, required_cols]
 
     log("Aplicando limpeza manual nas colunas selecionadas…")
     df = apply_manual_cleaning(df)
@@ -656,10 +499,6 @@ def main() -> None:
 
     # Preparar modelos
     models = get_models()
-    if not _HAS_XGB:
-        print("[Aviso] xgboost não instalado – pulando XGB.")
-    if not _HAS_LGBM:
-        print("[Aviso] lightgbm não instalado – pulando LGBM.")
 
     # Treinamento e avaliação por alvo
     log("Treinando e avaliando modelos para Binge…")
@@ -685,7 +524,7 @@ def main() -> None:
     print("===== RESUMO =====")
     def _fmt_res(res: Dict[str, Dict[str, float]]) -> List[str]:
         lines = []
-        for name in ["LogReg", "RF", "GB", "XGB", "LGBM"]:
+        for name in ["LogReg", "RF", "GB"]:
             if name in res:
                 v = res[name]
                 lines.append(
