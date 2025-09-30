@@ -8,16 +8,16 @@ Objetivo: Treinar modelos para dois alvos no BRFSS 2015 (binge drinking e fumant
 com pipeline de pré-processamento e salvar os artefatos. O script imprime mensagens
 didáticas no formato "PASSO X: ..." ao longo do processo.
 
-Observação importante: códigos de não resposta variam por coluna. A fonte de verdade são
-os metadados do arquivo JSON (2015_formats.json) e o PDF “dados do dataset.pdf”. Este
-script respeita a especificidade por coluna quando o JSON está disponível; caso contrário,
-aplica heurísticas seguras apenas aos códigos presentes em cada coluna.
+Observação importante: códigos de não resposta variam por coluna. Este
+script aplica regras específicas por coluna (limpeza manual) e uma heurística
+segura por coluna baseada em códigos clássicos presentes em cada coluna. Não há
+dependência de JSON externo.
 """
 
 from __future__ import annotations
 
 import os
-import json
+import argparse
 import warnings
 from typing import Dict, Set, Tuple, Any, List
 
@@ -33,22 +33,7 @@ from sklearn import impute
 from sklearn import linear_model
 from sklearn import ensemble
 from sklearn.pipeline import Pipeline
-
-# Tentar importar pacotes opcionais
-_HAS_XGB = False
-_HAS_LGBM = False
-try:
-    from xgboost import XGBClassifier  # type: ignore
-    _HAS_XGB = True
-except Exception:
-    _HAS_XGB = False
-
-try:
-    from lightgbm import LGBMClassifier  # type: ignore
-    _HAS_LGBM = True
-except Exception:
-    _HAS_LGBM = False
-
+from sklearn.base import BaseEstimator, TransformerMixin, clone
 
 # ==========================
 # Utilitário de logging
@@ -64,6 +49,20 @@ def log(msg: str) -> None:
 
 warnings.simplefilter("ignore")
 RANDOM_STATE = 42
+
+
+def _fmt_pct(value: float | None) -> str:
+    if value is None or np.isnan(value):
+        return "--"
+    return f"{value*100:.2f}%"
+
+
+def _print_confusion_matrix(matrix: List[List[int]]) -> None:
+    if not matrix or len(matrix) != 2 or any(len(row) != 2 for row in matrix):
+        return
+    print("    Matriz de confusão (linhas=real 0/1, colunas=prev 0/1)")
+    print(f"      [TN={matrix[0][0]:>6}  FP={matrix[0][1]:>6}]")
+    print(f"      [FN={matrix[1][0]:>6}  TP={matrix[1][1]:>6}]")
 
 
 # Lista de colunas selecionadas manualmente para o treinamento
@@ -101,106 +100,30 @@ def read_dataset(csv_path: str) -> pd.DataFrame:
     return pd.read_csv(csv_path, low_memory=False)
 
 
-def load_formats_json(json_path: str) -> Dict[str, Any] | None:
-    if not os.path.exists(json_path):
-        return None
-    try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        # Se o JSON estiver inválido, ignore de forma segura.
-        return None
-
-
-def build_missing_map(
-    df: pd.DataFrame, fmt_json: Dict[str, Any] | None
-) -> Dict[str, Set[Any]]:
+def build_missing_map(df: pd.DataFrame) -> Dict[str, Set[Any]]:
     """
     Constrói um mapa coluna->conjunto de códigos a serem tratados como ausentes (NaN).
 
-    - Se houver JSON de formatos (2015_formats.json), usa rótulos que indicam não resposta
-      (e.g., "Don't know", "Refused", "Missing", "Unknown") para coletar os códigos por coluna.
-    - Caso contrário, aplica heurística segura por coluna: somente adiciona aos ausentes
-      os códigos clássicos que existirem naquela coluna (p.ex. {7,9,77,88,99,555,777,888,999}).
-
-    Importante: os códigos de não resposta variam por coluna; JAMAS aplicar um conjunto
-    genérico a todas as colunas sem verificar presença na coluna.
+    Heurística segura por coluna: adiciona aos ausentes somente os códigos
+    clássicos que existirem naquela coluna (e.g. {7,9,77,88,99,555,777,888,999}).
     """
     missing_map: Dict[str, Set[Any]] = {c: set() for c in df.columns}
 
     classic_codes = {7, 9, 77, 88, 99, 555, 777, 888, 999}
     classic_str = {str(x) for x in classic_codes}
 
-    keywords = [
-        "don't know",
-        "dont know",
-        "refused",
-        "missing",
-        "unknown",
-        "not ascertained",
-        "dk",
-        "na",
-        "blank",
-        "illegible",
-    ]
+    for col in df.columns:
+        try:
+            uniques = set(pd.Series(df[col]).dropna().unique().tolist())
+        except Exception:
+            uniques = set()
 
-    if fmt_json is not None and isinstance(fmt_json, dict):
-        # Tentar inferir estrutura: col -> {code->label} ou col -> {"values": {code->label}} etc.
-        for col in df.columns:
-            try:
-                meta = fmt_json.get(col)
-                if meta is None:
-                    continue
-
-                # Diversas formas possíveis
-                if isinstance(meta, dict):
-                    # 1) Pode ser diretamente {code: label}
-                    candidates = meta
-                    # 2) Ou aninhado sob algumas chaves comuns
-                    for key in [
-                        "values",
-                        "codes",
-                        "labels",
-                        "mapping",
-                        "map",
-                        "value_labels",
-                    ]:
-                        if key in meta and isinstance(meta[key], dict):
-                            candidates = meta[key]
-                            break
-
-                    for k, v in candidates.items():
-                        # Tentar normalizar o código (k) e rótulo (v)
-                        try:
-                            code = int(k)
-                        except Exception:
-                            code = k
-
-                        label = str(v).strip().lower()
-
-                        if any(word in label for word in keywords) or (
-                            str(k).strip() in classic_str
-                        ):
-                            missing_map[col].add(code)
-            except Exception:
-                # Seja resiliente a inconsistências
-                continue
-
-    else:
-        # Heurística segura: por coluna, somente códigos clássicos existentes.
-        for col in df.columns:
-            try:
-                uniques = set(pd.Series(df[col]).dropna().unique().tolist())
-            except Exception:
-                uniques = set()
-
-            # Adicionar apenas os que existem na coluna (numérico e string)
-            for code in classic_codes:
-                if code in uniques:
-                    missing_map[col].add(code)
-            for code in classic_str:
-                if code in uniques:
-                    missing_map[col].add(code)
+        for code in classic_codes:
+            if code in uniques:
+                missing_map[col].add(code)
+        for code in classic_str:
+            if code in uniques:
+                missing_map[col].add(code)
 
     return missing_map
 
@@ -222,10 +145,10 @@ def apply_missing_map(df: pd.DataFrame, missing_map: Dict[str, Set[Any]]) -> pd.
 
 
 def apply_manual_cleaning(df: pd.DataFrame) -> pd.DataFrame:
-    """Aplica a limpeza manual informada pelo usuário às colunas relevantes."""
 
+#Limpeza manual conforme análise dos metadados e PDF
     replacements: Dict[str, Dict[Any, Any]] = {
-        "_RFDRHV5": {9: np.nan, 1: 0.0, 2: 1.0},
+        "_RFDRHV5": {9: np.nan},
         "_SMOKER3": {9: np.nan},
         "GENHLTH": {9: np.nan, 7: np.nan},
         "PHYSHLTH": {99: np.nan, 77: np.nan, 88: 0.0},
@@ -250,58 +173,150 @@ def apply_manual_cleaning(df: pd.DataFrame) -> pd.DataFrame:
     return df_clean
 
 
+class IQRClipper(TransformerMixin, BaseEstimator):
+    """Winsoriza valores fora do intervalo IQR multiplicado por um fator."""
+
+    def __init__(self, multiplier: float = 1.5) -> None:
+        self.multiplier = multiplier
+        self.lower_: np.ndarray | None = None
+        self.upper_: np.ndarray | None = None
+
+    def fit(self, X, y=None):  # type: ignore[override]
+        X_arr = np.asarray(X, dtype=float)
+        if X_arr.ndim == 1:
+            X_arr = X_arr.reshape(-1, 1)
+
+        n_features = X_arr.shape[1]
+        self.lower_ = np.full(n_features, np.nan)
+        self.upper_ = np.full(n_features, np.nan)
+
+        for idx in range(n_features):
+            col = X_arr[:, idx]
+            col = col[~np.isnan(col)]
+            if col.size == 0:
+                continue
+
+            q1 = np.percentile(col, 25)
+            q3 = np.percentile(col, 75)
+            iqr = q3 - q1
+
+            if iqr == 0:
+                lower = q1
+                upper = q3
+            else:
+                lower = q1 - self.multiplier * iqr
+                upper = q3 + self.multiplier * iqr
+
+            self.lower_[idx] = lower
+            self.upper_[idx] = upper
+
+        return self
+
+    def transform(self, X):  # type: ignore[override]
+        if self.lower_ is None or self.upper_ is None:
+            raise RuntimeError("IQRClipper deve ser ajustado antes do uso.")
+        X_arr = np.asarray(X, dtype=float)
+        reshape_needed = False
+        if X_arr.ndim == 1:
+            reshape_needed = True
+            X_arr = X_arr.reshape(-1, 1)
+
+        clipped = X_arr.copy()
+        for idx in range(clipped.shape[1]):
+            lower = self.lower_[idx]
+            upper = self.upper_[idx]
+            if np.isnan(lower) or np.isnan(upper):
+                continue
+            clipped[:, idx] = np.clip(clipped[:, idx], lower, upper)
+
+        if reshape_needed:
+            clipped = clipped.reshape(-1)
+
+        return clipped
+def create_balanced_sample(
+    df: pd.DataFrame,
+    y: pd.Series,
+    positive_label: float = 1.0,
+    negative_label: float = 0.0,
+    per_class: int = 25000,
+    random_state: int = RANDOM_STATE,
+    holdout_ratio: float = 0.1,
+) -> Tuple[pd.DataFrame, pd.Series, int, np.ndarray]:
+    """Seleciona amostra balanceada 50/50 entre classes positiva e negativa."""
+
+    valid_mask = y.isin([positive_label, negative_label])
+    y_valid = y.loc[valid_mask]
+
+    pos_idx = y_valid[y_valid == positive_label].index
+    neg_idx = y_valid[y_valid == negative_label].index
+
+    holdout_ratio = min(max(holdout_ratio, 0.0), 0.5)
+    holdout_pos = max(1, int(len(pos_idx) * holdout_ratio)) if len(pos_idx) > 0 else 0
+    holdout_neg = max(1, int(len(neg_idx) * holdout_ratio)) if len(neg_idx) > 0 else 0
+
+    available_pos = len(pos_idx) - holdout_pos
+    available_neg = len(neg_idx) - holdout_neg
+
+    actual_per_class = min(per_class, available_pos, available_neg)
+
+    if actual_per_class <= 0:
+        raise ValueError(
+            "Não há amostras suficientes para balanceamento: "
+            f"positivos disponíveis={len(pos_idx)}, negativos disponíveis={len(neg_idx)}, "
+            f"necessário por classe={per_class} após reservar {holdout_pos} positivos e {holdout_neg} negativos para teste."
+        )
+
+    rng = np.random.default_rng(random_state)
+    pos_sample = rng.choice(pos_idx, size=actual_per_class, replace=False)
+    neg_sample = rng.choice(neg_idx, size=actual_per_class, replace=False)
+
+    selected_idx = np.concatenate([pos_sample, neg_sample])
+    rng.shuffle(selected_idx)
+
+    return (
+        df.loc[selected_idx].copy(),
+        y.loc[selected_idx].copy(),
+        actual_per_class,
+        selected_idx,
+    )
+
+
 def derive_targets(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, List[str]]:
     """
-    Constrói os dois alvos: binge e fumante atual.
+    Constrói os dois alvos a partir das colunas já presentes no dataset reduzido.
 
-    - Binge (binário):
-        Preferir _RFBING5 se existir (mapear 2->1, 1->0, outros->NaN). Caso contrário,
-        derivar de DRNK3GE5: valores válidos > 0 nos últimos 30 dias => 1; 0/"none" => 0;
-        não resposta => NaN (já tratados por missing_map).
+    - Binge (binário) usa `_RFDRHV5`, onde 2 representa consumo excessivo e 1,
+      não consumo. O valor é transformado para 1.0 (binge) / 0.0 (não binge) e
+      outros códigos viram NaN.
+    - Fumante atual (binário) usa `_SMOKER3`: códigos 1/2 => 1.0 (fumantes),
+      códigos 3/4 => 0.0 (não fumantes); demais => NaN.
 
-    - Fumante atual (binário):
-        Preferir _SMOKER3: 1/2 => 1; 3/4 => 0; demais => NaN. Se ausente, SMOKDAY2 com
-        mapeamento 1/2 => 1; 3 => 0; demais => NaN.
-
-    Retorna (y_binge, y_smoke, leakage_cols) – leakage_cols devem ser removidas das features.
+    Retorna (y_binge, y_smoke, leakage_cols) – leakage_cols devem ser removidas
+    das features para evitar vazamentos.
     """
+    for required in ["_RFDRHV5", "_SMOKER3"]:
+        if required not in df.columns:
+            raise ValueError(
+                f"Não foi possível construir os alvos: coluna obrigatória {required} ausente."
+            )
+
     leakage_cols: List[str] = []
 
-    # Binge
-    if "_RFBING5" in df.columns:
-        leakage_cols.append("_RFBING5")
-        s = df["_RFBING5"]
-        y_binge = pd.Series(np.where(s == 2, 1.0, np.where(s == 1, 0.0, np.nan)), index=s.index)
-    elif "DRNK3GE5" in df.columns:
-        leakage_cols.append("DRNK3GE5")
-        s = df["DRNK3GE5"].copy()
-        # Tratar possíveis strings 'none'
-        s = s.replace({"none": 0, "None": 0, "NONE": 0})
-        s_num = pd.to_numeric(s, errors="coerce")
-        y_binge = (s_num.notna() & (s_num > 0)).astype(float)
-        # Valores 0 (ou 'none' convertido) => 0.0; NaNs já tratados
-    else:
-        raise ValueError(
-            "Não foi possível construir o alvo Binge: faltam colunas _RFBING5 e DRNK3GE5."
+    s_binge = pd.to_numeric(df["_RFDRHV5"], errors="coerce")
+    if not s_binge.dropna().isin({0.0, 1.0}).all():
+        s_binge = pd.Series(
+            np.where(s_binge == 2, 1.0, np.where(s_binge == 1, 0.0, np.nan)),
+            index=s_binge.index,
         )
+    y_binge = s_binge.astype(float)
+    leakage_cols.append("_RFDRHV5")
 
-    # Fumante atual
-    if "_SMOKER3" in df.columns:
-        leakage_cols.append("_SMOKER3")
-        s = df["_SMOKER3"]
-        y_smoke = pd.Series(
-            np.where(s.isin([1, 2]), 1.0, np.where(s.isin([3, 4]), 0.0, np.nan)), index=s.index
-        )
-    elif "SMOKDAY2" in df.columns:
-        leakage_cols.append("SMOKDAY2")
-        s = df["SMOKDAY2"]
-        y_smoke = pd.Series(
-            np.where(s.isin([1, 2]), 1.0, np.where(s == 3, 0.0, np.nan)), index=s.index
-        )
-    else:
-        raise ValueError(
-            "Não foi possível construir o alvo Fumante atual: faltam colunas _SMOKER3 e SMOKDAY2."
-        )
+    s_smoke = pd.to_numeric(df["_SMOKER3"], errors="coerce")
+    y_smoke = pd.Series(
+        np.where(s_smoke.isin([1, 2]), 1.0, np.where(s_smoke.isin([3, 4]), 0.0, np.nan)),
+        index=s_smoke.index,
+    )
+    leakage_cols.append("_SMOKER3")
 
     return y_binge, y_smoke, leakage_cols
 
@@ -356,6 +371,7 @@ def build_preprocess(cat_cols: List[str], num_cols: List[str]) -> compose.Column
     num_pipe = Pipeline(
         steps=[
             ("imputer", impute.SimpleImputer(strategy="median")),
+            ("clipper", IQRClipper()),
             ("scaler", skprep.StandardScaler()),
         ]
     )
@@ -369,51 +385,39 @@ def build_preprocess(cat_cols: List[str], num_cols: List[str]) -> compose.Column
     return preprocess
 
 
-def get_models() -> Dict[str, Any]:
-    models: Dict[str, Any] = {
+def get_models(mode: str = "full") -> Dict[str, Any]:
+    mode = (mode or "full").lower()
+    if mode == "quick":
+        return {
+            "LogReg": linear_model.LogisticRegression(
+                max_iter=200,
+                class_weight="balanced",
+                solver="liblinear",
+                random_state=RANDOM_STATE,
+            ),
+            "RF": ensemble.RandomForestClassifier(
+                n_estimators=200,
+                max_depth=20,
+                max_features="sqrt",
+                class_weight="balanced_subsample",
+                random_state=RANDOM_STATE,
+                n_jobs=-1,
+            ),
+        }
+    return {
         "LogReg": linear_model.LogisticRegression(
             max_iter=200, class_weight="balanced", solver="liblinear", random_state=RANDOM_STATE
         ),
         "RF": ensemble.RandomForestClassifier(
-            n_estimators=400,
+            n_estimators=500,
+            max_depth=25,
+            max_features="sqrt",
             class_weight="balanced_subsample",
             random_state=RANDOM_STATE,
             n_jobs=-1,
         ),
         "GB": ensemble.GradientBoostingClassifier(random_state=RANDOM_STATE),
     }
-
-    if _HAS_XGB:
-        try:
-            models["XGB"] = XGBClassifier(
-                n_estimators=300,
-                max_depth=6,
-                learning_rate=0.1,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=RANDOM_STATE,
-                eval_metric="logloss",
-                tree_method="hist",
-                n_jobs=-1,
-            )
-        except Exception:
-            pass
-
-    if _HAS_LGBM:
-        try:
-            models["LGBM"] = LGBMClassifier(
-                n_estimators=400,
-                num_leaves=31,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=RANDOM_STATE,
-                n_jobs=-1,
-            )
-        except Exception:
-            pass
-
-    return models
 
 
 def _proba_or_score(clf, X) -> np.ndarray:
@@ -433,115 +437,6 @@ def _proba_or_score(clf, X) -> np.ndarray:
     return preds.astype(float)
 
 
-def evaluate_model(clf, X_val, y_val, X_test, y_test) -> Tuple[float, float, float]:
-    val_pred = clf.predict(X_val)
-    test_pred = clf.predict(X_test)
-
-    val_acc = metrics.accuracy_score(y_val, val_pred)
-    test_acc = metrics.accuracy_score(y_test, test_pred)
-
-    try:
-        test_scores = _proba_or_score(clf, X_test)
-        test_auc = metrics.roc_auc_score(y_test, test_scores)
-    except Exception:
-        test_auc = np.nan
-
-    return val_acc, test_acc, test_auc
-
-
-def _compute_scale_pos_weight(y: pd.Series) -> float:
-    try:
-        pos = int((y == 1).sum())
-        neg = int((y == 0).sum())
-        if pos == 0:
-            return 1.0
-        return max(1.0, neg / max(1, pos))
-    except Exception:
-        return 1.0
-
-
-def tune_and_evaluate(
-    name: str,
-    base_pipe: Pipeline,
-    X_train,
-    y_train,
-    X_val,
-    y_val,
-    X_train_val,
-    y_train_val,
-    X_test,
-    y_test,
-) -> Tuple[Pipeline, float, float, float]:
-    """
-    Faz busca de hiperparâmetros para XGB/LGBM no conjunto de treino (com CV),
-    avalia no holdout de validação para referência e refita em train+val para
-    avaliar no teste final.
-    """
-    assert name in {"XGB", "LGBM"}
-
-    spw = _compute_scale_pos_weight(pd.Series(y_train))
-
-    if name == "XGB":
-        # Espaço de busca XGBoost — focado em controlar overfitting/complexidade
-        param_distributions = {
-            "clf__n_estimators": [200, 300, 400, 600, 800],
-            "clf__max_depth": [3, 4, 5, 6, 8, 10],
-            "clf__min_child_weight": [1, 2, 3, 5, 7, 10],
-            "clf__subsample": [0.6, 0.7, 0.8, 0.9, 1.0],
-            "clf__colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],
-            "clf__gamma": [0, 0.5, 1, 2],
-            "clf__reg_alpha": [0.0, 0.1, 0.5, 1.0, 2.0],
-            "clf__reg_lambda": [0.0, 0.5, 1.0, 2.0, 5.0, 10.0],
-            "clf__learning_rate": [0.01, 0.05, 0.1, 0.2],
-            "clf__scale_pos_weight": [1.0, spw, max(1.0, np.sqrt(spw))],
-        }
-        n_iter = 20
-    else:  # LGBM
-        param_distributions = {
-            "clf__n_estimators": [300, 400, 600, 800, 1000],
-            "clf__num_leaves": [15, 31, 63, 127],
-            "clf__max_depth": [-1, 4, 6, 8, 12],
-            "clf__min_child_samples": [5, 10, 20, 30, 50],
-            "clf__subsample": [0.6, 0.7, 0.8, 0.9, 1.0],
-            "clf__colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],
-            "clf__reg_alpha": [0.0, 0.1, 0.5, 1.0, 2.0],
-            "clf__reg_lambda": [0.0, 0.5, 1.0, 2.0, 5.0, 10.0],
-            "clf__learning_rate": [0.01, 0.05, 0.1, 0.2],
-            "clf__min_split_gain": [0.0, 0.1, 0.5, 1.0],
-        }
-        n_iter = 20
-
-    search = skms.RandomizedSearchCV(
-        base_pipe,
-        param_distributions=param_distributions,
-        n_iter=n_iter,
-        scoring="accuracy",
-        n_jobs=-1,
-        cv=3,
-        refit=False,
-        random_state=RANDOM_STATE,
-        verbose=0,
-    )
-
-    # Busca em X_train (sem usar validação)
-    search.fit(X_train, y_train)
-
-    # Construir pipeline final com melhores hiperparâmetros
-    best_params = search.best_params_
-    tuned_pipe: Pipeline = Pipeline(steps=[("prep", base_pipe.named_steps["prep"]), ("clf", base_pipe.named_steps["clf"])])
-    tuned_pipe.set_params(**best_params)
-
-    # 1) Métrica de validação (fit em X_train, pred em X_val)
-    tuned_pipe.fit(X_train, y_train)
-    val_acc, _, _ = evaluate_model(tuned_pipe, X_val, y_val, X_val, y_val)
-
-    # 2) Refit em train+val para avaliação final de teste
-    tuned_pipe.fit(X_train_val, y_train_val)
-    _, test_acc, test_auc = evaluate_model(tuned_pipe, X_val, y_val, X_test, y_test)
-
-    return tuned_pipe, float(val_acc), float(test_acc), float(test_auc)
-
-
 def fit_and_evaluate(
     df: pd.DataFrame,
     y: pd.Series,
@@ -550,95 +445,207 @@ def fit_and_evaluate(
     num_cols: List[str],
     target_name: str,
     models: Dict[str, Any],
+    test_size: float | int = 0.15,
+    val_fraction_within_train: float = 15 / 85,
+    external_X_test: pd.DataFrame | None = None,
+    external_y_test: pd.Series | None = None,
 ) -> Tuple[Dict[str, Dict[str, float]], Tuple[str, float, Pipeline]]:
     """
     - Filtra linhas com y ausente
-    - Split estratificado 70/15/15 (via 85/15 e depois 70/15 dentro do 85)
-    - Treina e avalia modelos, devolve resultados e o melhor por Test Accuracy
+    - Split estratificado conforme parâmetros (test_size pode ser fração ou inteiro)
+    - Treina e avalia modelos, devolve resultados e o melhor selecionado por Val Accuracy
+      (Test Accuracy reportado após ajuste final; se external_X_test estiver definido, usa-o)
     """
     # Filtrar apenas registros com y válido
+    feature_cols = cat_cols + num_cols
     mask = y.notna()
-    df_ = df.loc[mask, cat_cols + num_cols].copy()
+    df_ = df.loc[mask, feature_cols].copy()
     y_ = y.loc[mask].astype(int)
+    removed_rows = int((~mask).sum())
 
-    # Split 85/15 para treino+val e teste
+    log(f"Linhas com target ausente removidas para {target_name}: {removed_rows}.")
+
     X_train_val, X_test, y_train_val, y_test = skms.train_test_split(
-        df_, y_, test_size=0.15, stratify=y_, random_state=RANDOM_STATE
+        df_, y_, test_size=test_size, stratify=y_, random_state=RANDOM_STATE
     )
-    # Split treino/val para obter 70/15 do total
-    val_ratio_within_train = 15 / 85
+
+    if not 0 < val_fraction_within_train < 1:
+        raise ValueError("val_fraction_within_train deve estar entre 0 e 1.")
+
     X_train, X_val, y_train, y_val = skms.train_test_split(
         X_train_val,
         y_train_val,
-        test_size=val_ratio_within_train,
+        test_size=val_fraction_within_train,
         stratify=y_train_val,
         random_state=RANDOM_STATE,
     )
 
-    log(f"Split estratificado em treino/val/test definido para {target_name} (70/15/15).")
+    log(
+        f"Split estratificado definido para {target_name}: "
+        f"treino={len(X_train)}, val={len(X_val)}, teste={len(X_test)}."
+    )
 
     # Resultados
     results: Dict[str, Dict[str, float]] = {}
-    best_name = None
-    best_acc = -np.inf
-    best_pipe: Pipeline | None = None
+    best_name: str | None = None
+    best_val_acc = -np.inf
 
     for name, model in models.items():
-        pipe = Pipeline(steps=[("prep", preprocess), ("clf", model)])
+        pipe = Pipeline(
+            steps=[("prep", clone(preprocess)), ("clf", clone(model))]
+        )
 
-        # Tunar XGB/LGBM conforme solicitado; manter demais como antes
-        if name in {"XGB", "LGBM"}:
-            try:
-                tuned_pipe, val_acc, test_acc, test_auc = tune_and_evaluate(
-                    name, pipe, X_train, y_train, X_val, y_val, X_train_val, y_train_val, X_test, y_test
-                )
-                pipe = tuned_pipe
-            except Exception as e:
-                print(f"[Aviso] Falha ao tunar {name}: {e}. Usando parâmetros padrão.")
-                pipe.fit(X_train, y_train)
-                val_acc, test_acc, test_auc = evaluate_model(pipe, X_val, y_val, X_test, y_test)
-        else:
-            pipe.fit(X_train, y_train)
-            val_acc, test_acc, test_auc = evaluate_model(pipe, X_val, y_val, X_test, y_test)
+        pipe.fit(X_train, y_train)
+        val_pred = pipe.predict(X_val)
+        val_acc = metrics.accuracy_score(y_val, val_pred)
 
         results[name] = {
             "val_acc": float(val_acc),
-            "test_acc": float(test_acc),
-            "test_auc": float(test_auc) if not np.isnan(test_auc) else np.nan,
+            "test_acc": np.nan,
+            "test_auc": np.nan,
         }
 
         print(
-            f"Modelo={name} | Alvo={target_name.upper()} | "
-            f"Val Accuracy={val_acc*100:.2f}% | Test Accuracy={test_acc*100:.2f}% | "
-            f"Test ROC-AUC={(test_auc*100 if not np.isnan(test_auc) else np.nan):.2f}"
+            f"Modelo={name} | Alvo={target_name.upper()} | Val Accuracy={val_acc*100:.2f}%"
         )
 
-        if test_acc > best_acc:
-            best_acc = test_acc
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
             best_name = name
-            best_pipe = pipe
 
-    assert best_pipe is not None and best_name is not None
-    return results, (best_name, best_acc, best_pipe)
+    if best_name is None:
+        raise RuntimeError("Não foi possível selecionar o melhor modelo.")
+
+    log(
+        f"Reajustando o modelo {best_name} com dados de treino+validação para {target_name}."
+    )
+    final_pipe = Pipeline(
+        steps=[("prep", clone(preprocess)), ("clf", clone(models[best_name]))]
+    )
+    final_pipe.fit(X_train_val, y_train_val)
+
+    eval_X = X_test
+    eval_y = y_test
+    eval_desc = "teste interno estratificado"
+    if external_X_test is not None and external_y_test is not None:
+        eval_X = external_X_test
+        eval_y = external_y_test
+        eval_desc = "teste externo"
+        log(
+            f"Executando avaliação externa para {target_name} com {len(eval_X)} registros."
+        )
+
+    final_test_pred = final_pipe.predict(eval_X)
+    final_test_acc = metrics.accuracy_score(eval_y, final_test_pred)
+    try:
+        final_test_scores = _proba_or_score(final_pipe, eval_X)
+        final_test_auc = metrics.roc_auc_score(eval_y, final_test_scores)
+    except Exception:
+        final_test_auc = np.nan
+
+    results[best_name]["test_acc"] = float(final_test_acc)
+    results[best_name]["test_auc"] = (
+        float(final_test_auc) if not np.isnan(final_test_auc) else np.nan
+    )
+
+    try:
+        cm = metrics.confusion_matrix(eval_y, final_test_pred, labels=[0, 1])
+        if cm.shape == (2, 2):
+            tn, fp, fn, tp = cm.ravel()
+        else:
+            tn = fp = fn = tp = 0
+            cm = np.array([[0, 0], [0, 0]])
+    except Exception:
+        tn = fp = fn = tp = 0
+        cm = np.array([[0, 0], [0, 0]])
+
+    def _safe_div(a: int, b: int) -> float:
+        return float(a / b) if b else float("nan")
+
+    precision = _safe_div(tp, tp + fp)
+    recall = _safe_div(tp, tp + fn)
+    specificity = _safe_div(tn, tn + fp)
+    f1 = _safe_div(2 * tp, 2 * tp + fp + fn)
+
+    results[best_name]["confusion_matrix"] = [
+        [int(cm[0, 0]), int(cm[0, 1])],
+        [int(cm[1, 0]), int(cm[1, 1])],
+    ]
+    results[best_name]["precision"] = precision
+    results[best_name]["recall"] = recall
+    results[best_name]["specificity"] = specificity
+    results[best_name]["f1"] = f1
+
+    print(
+        f"Modelo selecionado (validação)={best_name} | Alvo={target_name.upper()} | "
+        f"Val Accuracy={best_val_acc*100:.2f}% | {eval_desc.title()} Accuracy={final_test_acc*100:.2f}% | "
+        f"{eval_desc.title()} ROC-AUC={(final_test_auc*100 if not np.isnan(final_test_auc) else np.nan):.2f}"
+    )
+
+    return results, (best_name, float(final_test_acc), final_pipe)
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--quick", action="store_true", help="Executa com modelos mais leves.")
+    parser.add_argument("--sample", type=int, default=None, help="Amostragem de N linhas do dataset.")
+    parser.add_argument(
+        "--balanced-binge",
+        action="store_true",
+        help="Cria amostra balanceada (50/50) para o alvo Binge antes do treinamento.",
+    )
+    parser.add_argument(
+        "--balanced-binge-size",
+        type=int,
+        default=25000,
+        help="Quantidade de amostras por classe (positiva/negativa) para balancear Binge.",
+    )
+    parser.add_argument(
+        "--balanced-binge-train",
+        type=int,
+        default=40000,
+        help="Tamanho desejado do conjunto de treino (treino+validação) após balanceamento de Binge.",
+    )
+    parser.add_argument(
+        "--balanced-binge-val-frac",
+        type=float,
+        default=0.2,
+        help="Fração do conjunto de treino (após balancear Binge) destinada à validação.",
+    )
+    parser.add_argument(
+        "--balanced-binge-holdout",
+        type=float,
+        default=0.1,
+        help="Proporção mínima por classe reservada para o teste externo de Binge (0-0.5).",
+    )
+    args = parser.parse_args()
     # Carregar dados
     log("Carregando dataset BRFSS 2015…")
     csv_path = os.path.join("data", "2015.csv")
+    required_cols = sorted(set(SELECTED_FEATURES + ["_RFDRHV5", "_SMOKER3"]))
     df = read_dataset(csv_path)
+    if args.sample is not None and args.sample > 0 and args.sample < len(df):
+        log(f"Amostrando {args.sample} linhas do dataset para execução rápida…")
+        df = df.sample(n=args.sample, random_state=RANDOM_STATE)
+
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(
+            "O dataset não contém as colunas necessárias para o treinamento: "
+            + ", ".join(missing_cols)
+        )
+
+    # Garantir que somente as colunas necessárias sejam utilizadas
+    df = df.loc[:, required_cols]
 
     log("Aplicando limpeza manual nas colunas selecionadas…")
     df = apply_manual_cleaning(df)
 
-    # Ler metadados e construir mapa de ausentes
-    log("Lendo 2015_formats.json (se disponível) para mapear códigos ausentes por coluna…")
-    json_path = os.path.join("data", "2015_formats.json")
-    fmt_json = load_formats_json(json_path)
-
-    missing_map = build_missing_map(df, fmt_json)
+    # Construir e aplicar mapa de ausentes (heurística por coluna)
+    log("Mapeando códigos de não resposta por coluna (heurística segura)…")
+    missing_map = build_missing_map(df)
     df = apply_missing_map(df, missing_map)
-    log("Ausentes tratados respeitando a especificidade por coluna.")
+    log("Ausentes tratados respeitando a especificidade por coluna (heurística).")
 
     # Construção dos alvos
     log("Construindo os alvos (Binge e Fumante atual)…")
@@ -651,20 +658,101 @@ def main() -> None:
         raise RuntimeError("Nenhuma feature disponível após filtragem.")
 
     # Pré-processamento
-    log("Montando pipeline de pré-processamento (imputação + one-hot + padronização)…")
+    log(
+        "Montando pipeline de pré-processamento (imputação + clipping IQR + one-hot + padronização)…"
+    )
     preprocess = build_preprocess(cat_cols, num_cols)
 
     # Preparar modelos
-    models = get_models()
-    if not _HAS_XGB:
-        print("[Aviso] xgboost não instalado – pulando XGB.")
-    if not _HAS_LGBM:
-        print("[Aviso] lightgbm não instalado – pulando LGBM.")
+    models = get_models("quick" if args.quick else "full")
 
     # Treinamento e avaliação por alvo
+    binge_df = df
+    binge_y = y_binge
+    binge_test_size: float | int = 0.15
+    binge_val_fraction = 15 / 85
+
+    if args.balanced_binge:
+        per_class = args.balanced_binge_size
+        total_requested = per_class * 2
+        log(
+            "Gerando amostra balanceada para Binge (" \
+            f"{per_class} positivos e {per_class} negativos; total={total_requested})…"
+        )
+        binge_df, binge_y, actual_per_class, binge_selected_idx = create_balanced_sample(
+            df,
+            y_binge,
+            positive_label=1.0,
+            negative_label=0.0,
+            per_class=per_class,
+            random_state=RANDOM_STATE,
+            holdout_ratio=args.balanced_binge_holdout,
+        )
+
+        total_selected = actual_per_class * 2
+        if actual_per_class < per_class:
+            log(
+                f"Aviso: somente {actual_per_class} amostras por classe disponíveis para Binge; "
+                f"utilizando total={total_selected}."
+            )
+
+        internal_test_min_frac = 0.1
+        min_test_required = max(2, int(total_selected * internal_test_min_frac))
+        if total_selected <= min_test_required:
+            raise ValueError(
+                "Amostra balanceada para Binge é muito pequena para separar treino e teste internos."
+            )
+        train_target = min(args.balanced_binge_train, total_selected - min_test_required)
+        if train_target <= 0:
+            raise ValueError(
+                "balanced-binge-train deve ser positivo e menor que o total selecionado."
+            )
+        binge_test_size = len(binge_df) - train_target
+        if binge_test_size <= 0:
+            raise ValueError(
+                "Configuração de balanceamento deixou o conjunto de teste vazio."
+            )
+        binge_val_fraction = args.balanced_binge_val_frac
+        log(
+            f"Amostra balanceada criada: total={len(binge_df)}, treino+val={train_target}, "
+            f"teste={binge_test_size}. Validação dentro do treino: {binge_val_fraction*100:.2f}%"
+        )
+
+    binge_external_X: pd.DataFrame | None = None
+    binge_external_y: pd.Series | None = None
+
+    if args.balanced_binge:
+        valid_idx = df.loc[y_binge.notna()].index
+        selected_idx = pd.Index(binge_selected_idx)
+        remaining_idx = valid_idx.difference(selected_idx)
+        if remaining_idx.empty:
+            raise ValueError(
+                "Após separar o conjunto balanceado de treino, não restaram dados para teste externo."
+            )
+        binge_external_X = df.loc[remaining_idx, cat_cols + num_cols].copy()
+        binge_external_y = y_binge.loc[remaining_idx].astype(int)
+        log(
+            f"Teste externo de Binge utilizará {len(binge_external_X)} registros (complemento do balanceado)."
+        )
+
+    else:
+        binge_eval_mask = y_binge.notna()
+        binge_external_X = df.loc[binge_eval_mask, cat_cols + num_cols].copy()
+        binge_external_y = y_binge.loc[binge_eval_mask].astype(int)
+
     log("Treinando e avaliando modelos para Binge…")
     binge_results, (binge_best_name, binge_best_acc, binge_best_pipe) = fit_and_evaluate(
-        df, y_binge, preprocess, cat_cols, num_cols, target_name="Binge", models=models
+        binge_df,
+        binge_y,
+        preprocess,
+        cat_cols,
+        num_cols,
+        target_name="Binge",
+        models=models,
+        test_size=binge_test_size,
+        val_fraction_within_train=binge_val_fraction,
+        external_X_test=binge_external_X,
+        external_y_test=binge_external_y,
     )
 
     log("Treinando e avaliando modelos para Fumante atual…")
@@ -675,41 +763,59 @@ def main() -> None:
     log("Treinamento e avaliação concluídos para todos os modelos.")
 
     # Salvar artefatos
-    log("Salvando modelos e pipeline em models/…")
+    log("Salvando pipelines treinados em models/…")
     os.makedirs("models", exist_ok=True)
-    dump(preprocess, os.path.join("models", "feature_pipeline.joblib"))
     dump(binge_best_pipe, os.path.join("models", "alcohol_binge_model.joblib"))
     dump(smoke_best_pipe, os.path.join("models", "smoker_current_model.joblib"))
 
     # Relatório final amigável
-    print("===== RESUMO =====")
-    def _fmt_res(res: Dict[str, Dict[str, float]]) -> List[str]:
-        lines = []
-        for name in ["LogReg", "RF", "GB", "XGB", "LGBM"]:
-            if name in res:
-                v = res[name]
-                lines.append(
-                    f"  - {name}: Val {v['val_acc']*100:.2f}% | Test {v['test_acc']*100:.2f}%"
-                )
-        return lines
+    print("\n========== RESULTADOS ==========")
 
-    print("Alvo: Binge")
-    for line in _fmt_res(binge_results):
-        print(line)
-    print(
-        f"  -> Melhor (por Test Accuracy): {binge_best_name} ({binge_best_acc*100:.2f}%)"
-    )
+    def _print_target_block(
+        label: str,
+        results: Dict[str, Dict[str, float]],
+        best_name: str,
+        best_acc: float,
+    ) -> None:
+        print(f"\n>> {label.upper()}")
+        print("  Modelos avaliados:")
+        for name in sorted(results.keys()):
+            metrics_map = results[name]
+            val_txt = _fmt_pct(metrics_map.get("val_acc"))
+            test_txt = _fmt_pct(metrics_map.get("test_acc"))
+            auc_txt = _fmt_pct(metrics_map.get("test_auc"))
+            print(f"    - {name:<30} | Val={val_txt:<8} Test={test_txt:<8} ROC-AUC={auc_txt:<8}")
 
-    print("Alvo: Fumante atual")
-    for line in _fmt_res(smoke_results):
-        print(line)
-    print(
-        f"  -> Melhor (por Test Accuracy): {smoke_best_name} ({smoke_best_acc*100:.2f}%)"
-    )
+        best_metrics = results[best_name]
+        print(f"\n  Melhor modelo: {best_name}")
+        print(
+            "    → Val={val} | Test={test} | ROC-AUC={auc}"
+            .format(
+                val=_fmt_pct(best_metrics.get("val_acc")),
+                test=_fmt_pct(best_metrics.get("test_acc")),
+                auc=_fmt_pct(best_metrics.get("test_auc")),
+            )
+        )
+
+        _print_confusion_matrix(best_metrics.get("confusion_matrix", []))
+
+        print(
+            "    Métricas complementares: Precisão={p:.3f} | Recall={r:.3f} | "
+            "Especificidade={s:.3f} | F1={f:.3f}"
+            .format(
+                p=best_metrics.get("precision", float("nan")),
+                r=best_metrics.get("recall", float("nan")),
+                s=best_metrics.get("specificity", float("nan")),
+                f=best_metrics.get("f1", float("nan")),
+            )
+        )
+
+    _print_target_block("Binge", binge_results, binge_best_name, binge_best_acc)
+    _print_target_block("Fumante atual", smoke_results, smoke_best_name, smoke_best_acc)
 
     print(
-        "Observação: accuracy em %; dataset: BRFSS 2015; ausentes tratados por coluna conforme "
-        "formatos/JSON e PDF."
+        "\nObservações: accuracy em %; dataset BRFSS 2015; ausentes tratados por coluna "
+        "via regras específicas e heurística segura."
     )
 
 
