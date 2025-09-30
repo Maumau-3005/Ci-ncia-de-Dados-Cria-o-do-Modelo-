@@ -17,6 +17,7 @@ dependência de JSON externo.
 from __future__ import annotations
 
 import os
+import argparse
 import warnings
 from typing import Dict, Set, Tuple, Any, List
 
@@ -32,6 +33,7 @@ from sklearn import impute
 from sklearn import linear_model
 from sklearn import ensemble
 from sklearn.pipeline import Pipeline
+from sklearn.base import BaseEstimator, TransformerMixin, clone
 
 # ==========================
 # Utilitário de logging
@@ -157,49 +159,99 @@ def apply_manual_cleaning(df: pd.DataFrame) -> pd.DataFrame:
     return df_clean
 
 
-def remove_outliers_iqr(
-    df: pd.DataFrame, numeric_cols: Set[str], multiplier: float = 1.5
-) -> Tuple[pd.DataFrame, int]:
-    """Remove linhas com outliers (método IQR) nas colunas numéricas informadas."""
-    if not numeric_cols:
-        return df.copy(), 0
+class IQRClipper(TransformerMixin, BaseEstimator):
+    """Winsoriza valores fora do intervalo IQR multiplicado por um fator."""
 
-    mask = pd.Series(True, index=df.index)
+    def __init__(self, multiplier: float = 1.5) -> None:
+        self.multiplier = multiplier
+        self.lower_: np.ndarray | None = None
+        self.upper_: np.ndarray | None = None
 
-    for col in numeric_cols:
-        if col not in df.columns:
-            continue
+    def fit(self, X, y=None):  # type: ignore[override]
+        X_arr = np.asarray(X, dtype=float)
+        if X_arr.ndim == 1:
+            X_arr = X_arr.reshape(-1, 1)
 
-        series = pd.to_numeric(df[col], errors="coerce")
-        q1 = series.quantile(0.25)
-        q3 = series.quantile(0.75)
+        n_features = X_arr.shape[1]
+        self.lower_ = np.full(n_features, np.nan)
+        self.upper_ = np.full(n_features, np.nan)
 
-        if pd.isna(q1) or pd.isna(q3):
-            continue
+        for idx in range(n_features):
+            col = X_arr[:, idx]
+            col = col[~np.isnan(col)]
+            if col.size == 0:
+                continue
 
-        iqr = q3 - q1
-        if iqr == 0:
-            continue
+            q1 = np.percentile(col, 25)
+            q3 = np.percentile(col, 75)
+            iqr = q3 - q1
 
-        lower = q1 - multiplier * iqr
-        upper = q3 + multiplier * iqr
-        col_mask = series.isna() | ((series >= lower) & (series <= upper))
-        mask &= col_mask
+            if iqr == 0:
+                lower = q1
+                upper = q3
+            else:
+                lower = q1 - self.multiplier * iqr
+                upper = q3 + self.multiplier * iqr
 
-    filtered_df = df.loc[mask].copy()
-    removed_rows = int((~mask).sum())
-    return filtered_df, removed_rows
+            self.lower_[idx] = lower
+            self.upper_[idx] = upper
 
+        return self
 
-def filter_target_rows(
-    df: pd.DataFrame, y: pd.Series, feature_cols: List[str]
+    def transform(self, X):  # type: ignore[override]
+        if self.lower_ is None or self.upper_ is None:
+            raise RuntimeError("IQRClipper deve ser ajustado antes do uso.")
+        X_arr = np.asarray(X, dtype=float)
+        reshape_needed = False
+        if X_arr.ndim == 1:
+            reshape_needed = True
+            X_arr = X_arr.reshape(-1, 1)
+
+        clipped = X_arr.copy()
+        for idx in range(clipped.shape[1]):
+            lower = self.lower_[idx]
+            upper = self.upper_[idx]
+            if np.isnan(lower) or np.isnan(upper):
+                continue
+            clipped[:, idx] = np.clip(clipped[:, idx], lower, upper)
+
+        if reshape_needed:
+            clipped = clipped.reshape(-1)
+
+        return clipped
+def create_balanced_sample(
+    df: pd.DataFrame,
+    y: pd.Series,
+    positive_label: float = 1.0,
+    negative_label: float = 0.0,
+    per_class: int = 25000,
+    random_state: int = RANDOM_STATE,
 ) -> Tuple[pd.DataFrame, pd.Series, int]:
-    """Retira linhas com target ausente e devolve subconjunto pronto para treino."""
-    mask = y.notna()
-    filtered_X = df.loc[mask, feature_cols].copy()
-    filtered_y = y.loc[mask].astype(int)
-    removed_rows = int((~mask).sum())
-    return filtered_X, filtered_y, removed_rows
+    """Seleciona amostra balanceada 50/50 entre classes positiva e negativa."""
+
+    valid_mask = y.isin([positive_label, negative_label])
+    y_valid = y.loc[valid_mask]
+
+    pos_idx = y_valid[y_valid == positive_label].index
+    neg_idx = y_valid[y_valid == negative_label].index
+
+    actual_per_class = min(per_class, len(pos_idx), len(neg_idx))
+
+    if actual_per_class <= 0:
+        raise ValueError(
+            "Não há amostras suficientes para balanceamento: "
+            f"positivos disponíveis={len(pos_idx)}, negativos disponíveis={len(neg_idx)}, "
+            f"necessário por classe={per_class}."
+        )
+
+    rng = np.random.default_rng(random_state)
+    pos_sample = rng.choice(pos_idx, size=actual_per_class, replace=False)
+    neg_sample = rng.choice(neg_idx, size=actual_per_class, replace=False)
+
+    selected_idx = np.concatenate([pos_sample, neg_sample])
+    rng.shuffle(selected_idx)
+
+    return df.loc[selected_idx].copy(), y.loc[selected_idx].copy(), actual_per_class
 
 
 def derive_targets(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, List[str]]:
@@ -207,7 +259,8 @@ def derive_targets(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, List[str]]:
     Constrói os dois alvos a partir das colunas já presentes no dataset reduzido.
 
     - Binge (binário) usa `_RFDRHV5`, onde 2 representa consumo excessivo e 1,
-      não consumo. O valor é transformado para 1.0/0.0 e outros códigos viram NaN.
+      não consumo. O valor é transformado para 1.0 (binge) / 0.0 (não binge) e
+      outros códigos viram NaN.
     - Fumante atual (binário) usa `_SMOKER3`: códigos 1/2 => 1.0 (fumantes),
       códigos 3/4 => 0.0 (não fumantes); demais => NaN.
 
@@ -225,7 +278,7 @@ def derive_targets(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, List[str]]:
     s_binge = pd.to_numeric(df["_RFDRHV5"], errors="coerce")
     if not s_binge.dropna().isin({0.0, 1.0}).all():
         s_binge = pd.Series(
-            np.where(s_binge == 1, 1.0, np.where(s_binge == 2, 0.0, np.nan)),
+            np.where(s_binge == 2, 1.0, np.where(s_binge == 1, 0.0, np.nan)),
             index=s_binge.index,
         )
     y_binge = s_binge.astype(float)
@@ -291,6 +344,7 @@ def build_preprocess(cat_cols: List[str], num_cols: List[str]) -> compose.Column
     num_pipe = Pipeline(
         steps=[
             ("imputer", impute.SimpleImputer(strategy="median")),
+            ("clipper", IQRClipper()),
             ("scaler", skprep.StandardScaler()),
         ]
     )
@@ -304,7 +358,24 @@ def build_preprocess(cat_cols: List[str], num_cols: List[str]) -> compose.Column
     return preprocess
 
 
-def get_models() -> Dict[str, Any]:
+def get_models(mode: str = "full") -> Dict[str, Any]:
+    mode = (mode or "full").lower()
+    if mode == "quick":
+        return {
+            "LogReg": linear_model.LogisticRegression(
+                max_iter=200,
+                class_weight="balanced",
+                solver="liblinear",
+                random_state=RANDOM_STATE,
+            ),
+            # Opção rápida: RF menor
+            "RF": ensemble.RandomForestClassifier(
+                n_estimators=100,
+                class_weight="balanced_subsample",
+                random_state=RANDOM_STATE,
+                n_jobs=-1,
+            ),
+        }
     return {
         "LogReg": linear_model.LogisticRegression(
             max_iter=200, class_weight="balanced", solver="liblinear", random_state=RANDOM_STATE
@@ -336,24 +407,6 @@ def _proba_or_score(clf, X) -> np.ndarray:
     return preds.astype(float)
 
 
-def evaluate_model(clf, X_val, y_val, X_test, y_test) -> Tuple[float, float, float]:
-    val_pred = clf.predict(X_val)
-    test_pred = clf.predict(X_test)
-
-    val_acc = metrics.accuracy_score(y_val, val_pred)
-    test_acc = metrics.accuracy_score(y_test, test_pred)
-
-    try:
-        test_scores = _proba_or_score(clf, X_test)
-        test_auc = metrics.roc_auc_score(y_test, test_scores)
-    except Exception:
-        test_auc = np.nan
-
-    return val_acc, test_acc, test_auc
-
-
-
-
 def fit_and_evaluate(
     df: pd.DataFrame,
     y: pd.Series,
@@ -362,75 +415,169 @@ def fit_and_evaluate(
     num_cols: List[str],
     target_name: str,
     models: Dict[str, Any],
+    test_size: float | int = 0.15,
+    val_fraction_within_train: float = 15 / 85,
 ) -> Tuple[Dict[str, Dict[str, float]], Tuple[str, float, Pipeline]]:
     """
     - Filtra linhas com y ausente
-    - Split estratificado 70/15/15 (via 85/15 e depois 70/15 dentro do 85)
-    - Treina e avalia modelos, devolve resultados e o melhor por Test Accuracy
+    - Split estratificado conforme parâmetros (test_size pode ser fração ou inteiro)
+    - Treina e avalia modelos, devolve resultados e o melhor selecionado por Val Accuracy
+      (Test Accuracy reportado apenas após ajuste em treino+val)
     """
     # Filtrar apenas registros com y válido
     feature_cols = cat_cols + num_cols
-    df_, y_, removed_rows = filter_target_rows(df, y, feature_cols)
+    mask = y.notna()
+    df_ = df.loc[mask, feature_cols].copy()
+    y_ = y.loc[mask].astype(int)
+    removed_rows = int((~mask).sum())
 
-    log(
-        f"Linhas com target ausente removidas para {target_name}: {removed_rows}."
-    )
+    log(f"Linhas com target ausente removidas para {target_name}: {removed_rows}.")
 
-    # Split 85/15 para treino+val e teste
     X_train_val, X_test, y_train_val, y_test = skms.train_test_split(
-        df_, y_, test_size=0.15, stratify=y_, random_state=RANDOM_STATE
+        df_, y_, test_size=test_size, stratify=y_, random_state=RANDOM_STATE
     )
-    # Split treino/val para obter 70/15 do total
-    val_ratio_within_train = 15 / 85
+
+    if not 0 < val_fraction_within_train < 1:
+        raise ValueError("val_fraction_within_train deve estar entre 0 e 1.")
+
     X_train, X_val, y_train, y_val = skms.train_test_split(
         X_train_val,
         y_train_val,
-        test_size=val_ratio_within_train,
+        test_size=val_fraction_within_train,
         stratify=y_train_val,
         random_state=RANDOM_STATE,
     )
 
-    log(f"Split estratificado em treino/val/test definido para {target_name} (70/15/15).")
+    log(
+        f"Split estratificado definido para {target_name}: "
+        f"treino={len(X_train)}, val={len(X_val)}, teste={len(X_test)}."
+    )
 
     # Resultados
     results: Dict[str, Dict[str, float]] = {}
-    best_name = None
-    best_acc = -np.inf
-    best_pipe: Pipeline | None = None
+    best_name: str | None = None
+    best_val_acc = -np.inf
 
     for name, model in models.items():
-        pipe = Pipeline(steps=[("prep", preprocess), ("clf", model)])
+        pipe = Pipeline(
+            steps=[("prep", clone(preprocess)), ("clf", clone(model))]
+        )
 
         pipe.fit(X_train, y_train)
-        val_acc, test_acc, test_auc = evaluate_model(pipe, X_val, y_val, X_test, y_test)
+        val_pred = pipe.predict(X_val)
+        val_acc = metrics.accuracy_score(y_val, val_pred)
 
         results[name] = {
             "val_acc": float(val_acc),
-            "test_acc": float(test_acc),
-            "test_auc": float(test_auc) if not np.isnan(test_auc) else np.nan,
+            "test_acc": np.nan,
+            "test_auc": np.nan,
         }
 
         print(
-            f"Modelo={name} | Alvo={target_name.upper()} | "
-            f"Val Accuracy={val_acc*100:.2f}% | Test Accuracy={test_acc*100:.2f}% | "
-            f"Test ROC-AUC={(test_auc*100 if not np.isnan(test_auc) else np.nan):.2f}"
+            f"Modelo={name} | Alvo={target_name.upper()} | Val Accuracy={val_acc*100:.2f}%"
         )
 
-        if test_acc > best_acc:
-            best_acc = test_acc
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
             best_name = name
-            best_pipe = pipe
 
-    assert best_pipe is not None and best_name is not None
-    return results, (best_name, best_acc, best_pipe)
+    if best_name is None:
+        raise RuntimeError("Não foi possível selecionar o melhor modelo.")
+
+    log(
+        f"Reajustando o modelo {best_name} com dados de treino+validação para {target_name}."
+    )
+    final_pipe = Pipeline(
+        steps=[("prep", clone(preprocess)), ("clf", clone(models[best_name]))]
+    )
+    final_pipe.fit(X_train_val, y_train_val)
+
+    final_test_pred = final_pipe.predict(X_test)
+    final_test_acc = metrics.accuracy_score(y_test, final_test_pred)
+    try:
+        final_test_scores = _proba_or_score(final_pipe, X_test)
+        final_test_auc = metrics.roc_auc_score(y_test, final_test_scores)
+    except Exception:
+        final_test_auc = np.nan
+
+    results[best_name]["test_acc"] = float(final_test_acc)
+    results[best_name]["test_auc"] = (
+        float(final_test_auc) if not np.isnan(final_test_auc) else np.nan
+    )
+
+    try:
+        cm = metrics.confusion_matrix(y_test, final_test_pred, labels=[0, 1])
+        if cm.shape == (2, 2):
+            tn, fp, fn, tp = cm.ravel()
+        else:
+            tn = fp = fn = tp = 0
+            cm = np.array([[0, 0], [0, 0]])
+    except Exception:
+        tn = fp = fn = tp = 0
+        cm = np.array([[0, 0], [0, 0]])
+
+    def _safe_div(a: int, b: int) -> float:
+        return float(a / b) if b else float("nan")
+
+    precision = _safe_div(tp, tp + fp)
+    recall = _safe_div(tp, tp + fn)
+    specificity = _safe_div(tn, tn + fp)
+    f1 = _safe_div(2 * tp, 2 * tp + fp + fn)
+
+    results[best_name]["confusion_matrix"] = [
+        [int(cm[0, 0]), int(cm[0, 1])],
+        [int(cm[1, 0]), int(cm[1, 1])],
+    ]
+    results[best_name]["precision"] = precision
+    results[best_name]["recall"] = recall
+    results[best_name]["specificity"] = specificity
+    results[best_name]["f1"] = f1
+
+    print(
+        f"Modelo selecionado (validação)={best_name} | Alvo={target_name.upper()} | "
+        f"Val Accuracy={best_val_acc*100:.2f}% | Test Accuracy (reajustado)={final_test_acc*100:.2f}% | "
+        f"Test ROC-AUC (reajustado)={(final_test_auc*100 if not np.isnan(final_test_auc) else np.nan):.2f}"
+    )
+
+    return results, (best_name, float(final_test_acc), final_pipe)
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--quick", action="store_true", help="Executa com modelos mais leves.")
+    parser.add_argument("--sample", type=int, default=None, help="Amostragem de N linhas do dataset.")
+    parser.add_argument(
+        "--balanced-binge",
+        action="store_true",
+        help="Cria amostra balanceada (50/50) para o alvo Binge antes do treinamento.",
+    )
+    parser.add_argument(
+        "--balanced-binge-size",
+        type=int,
+        default=25000,
+        help="Quantidade de amostras por classe (positiva/negativa) para balancear Binge.",
+    )
+    parser.add_argument(
+        "--balanced-binge-train",
+        type=int,
+        default=40000,
+        help="Tamanho desejado do conjunto de treino (treino+validação) após balanceamento de Binge.",
+    )
+    parser.add_argument(
+        "--balanced-binge-val-frac",
+        type=float,
+        default=0.2,
+        help="Fração do conjunto de treino (após balancear Binge) destinada à validação.",
+    )
+    args = parser.parse_args()
     # Carregar dados
     log("Carregando dataset BRFSS 2015…")
     csv_path = os.path.join("data", "2015.csv")
     required_cols = sorted(set(SELECTED_FEATURES + ["_RFDRHV5", "_SMOKER3"]))
     df = read_dataset(csv_path)
+    if args.sample is not None and args.sample > 0 and args.sample < len(df):
+        log(f"Amostrando {args.sample} linhas do dataset para execução rápida…")
+        df = df.sample(n=args.sample, random_state=RANDOM_STATE)
 
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
@@ -451,13 +598,6 @@ def main() -> None:
     df = apply_missing_map(df, missing_map)
     log("Ausentes tratados respeitando a especificidade por coluna (heurística).")
 
-    df, removed_outliers = remove_outliers_iqr(df, NUMERIC_SELECTED)
-    numeric_list = ", ".join(sorted(NUMERIC_SELECTED))
-    log(
-        "Remoção de outliers concluída nas colunas numéricas selecionadas "
-        f"({numeric_list}); {removed_outliers} linhas eliminadas."
-    )
-
     # Construção dos alvos
     log("Construindo os alvos (Binge e Fumante atual)…")
     y_binge, y_smoke, leakage_cols = derive_targets(df)
@@ -469,16 +609,70 @@ def main() -> None:
         raise RuntimeError("Nenhuma feature disponível após filtragem.")
 
     # Pré-processamento
-    log("Montando pipeline de pré-processamento (imputação + one-hot + padronização)…")
+    log(
+        "Montando pipeline de pré-processamento (imputação + clipping IQR + one-hot + padronização)…"
+    )
     preprocess = build_preprocess(cat_cols, num_cols)
 
     # Preparar modelos
-    models = get_models()
+    models = get_models("quick" if args.quick else "full")
 
     # Treinamento e avaliação por alvo
+    binge_df = df
+    binge_y = y_binge
+    binge_test_size: float | int = 0.15
+    binge_val_fraction = 15 / 85
+
+    if args.balanced_binge:
+        per_class = args.balanced_binge_size
+        total_requested = per_class * 2
+        log(
+            "Gerando amostra balanceada para Binge (" \
+            f"{per_class} positivos e {per_class} negativos; total={total_requested})…"
+        )
+        binge_df, binge_y, actual_per_class = create_balanced_sample(
+            df,
+            y_binge,
+            positive_label=1.0,
+            negative_label=0.0,
+            per_class=per_class,
+            random_state=RANDOM_STATE,
+        )
+
+        total_selected = actual_per_class * 2
+        if actual_per_class < per_class:
+            log(
+                f"Aviso: somente {actual_per_class} amostras por classe disponíveis para Binge; "
+                f"utilizando total={total_selected}."
+            )
+
+        train_target = min(args.balanced_binge_train, total_selected - 1)
+        if train_target <= 0:
+            raise ValueError(
+                "balanced-binge-train deve ser positivo e menor que o total selecionado."
+            )
+        binge_test_size = len(binge_df) - train_target
+        if binge_test_size <= 0:
+            raise ValueError(
+                "Configuração de balanceamento deixou o conjunto de teste vazio."
+            )
+        binge_val_fraction = args.balanced_binge_val_frac
+        log(
+            f"Amostra balanceada criada: total={len(binge_df)}, treino+val={train_target}, "
+            f"teste={binge_test_size}. Validação dentro do treino: {binge_val_fraction*100:.2f}%"
+        )
+
     log("Treinando e avaliando modelos para Binge…")
     binge_results, (binge_best_name, binge_best_acc, binge_best_pipe) = fit_and_evaluate(
-        df, y_binge, preprocess, cat_cols, num_cols, target_name="Binge", models=models
+        binge_df,
+        binge_y,
+        preprocess,
+        cat_cols,
+        num_cols,
+        target_name="Binge",
+        models=models,
+        test_size=binge_test_size,
+        val_fraction_within_train=binge_val_fraction,
     )
 
     log("Treinando e avaliando modelos para Fumante atual…")
@@ -489,9 +683,8 @@ def main() -> None:
     log("Treinamento e avaliação concluídos para todos os modelos.")
 
     # Salvar artefatos
-    log("Salvando modelos e pipeline em models/…")
+    log("Salvando pipelines treinados em models/…")
     os.makedirs("models", exist_ok=True)
-    dump(preprocess, os.path.join("models", "feature_pipeline.joblib"))
     dump(binge_best_pipe, os.path.join("models", "alcohol_binge_model.joblib"))
     dump(smoke_best_pipe, os.path.join("models", "smoker_current_model.joblib"))
 
@@ -499,27 +692,57 @@ def main() -> None:
     print("===== RESUMO =====")
     def _fmt_res(res: Dict[str, Dict[str, float]]) -> List[str]:
         lines = []
-        for name in ["LogReg", "RF", "GB"]:
-            if name in res:
-                v = res[name]
-                lines.append(
-                    f"  - {name}: Val {v['val_acc']*100:.2f}% | Test {v['test_acc']*100:.2f}%"
-                )
+        for name in sorted(res.keys()):
+            v = res[name]
+            test_display = "--"
+            if not np.isnan(v["test_acc"]):
+                test_display = f"{v['test_acc']*100:.2f}%"
+            lines.append(
+                f"  - {name}: Val {v['val_acc']*100:.2f}% | Test {test_display}"
+            )
         return lines
 
     print("Alvo: Binge")
     for line in _fmt_res(binge_results):
         print(line)
+    binge_best_val = binge_results[binge_best_name]["val_acc"] * 100
     print(
-        f"  -> Melhor (por Test Accuracy): {binge_best_name} ({binge_best_acc*100:.2f}%)"
+        f"  -> Melhor: {binge_best_name} (Val {binge_best_val:.2f}% | Test {binge_best_acc*100:.2f}%)"
     )
+    cm_b = binge_results[binge_best_name].get("confusion_matrix")
+    if cm_b:
+        print("  Matriz de confusão (Teste) [verdadeiro 0/1 x previsto 0/1]:")
+        print(f"    [{cm_b[0][0]}  {cm_b[0][1]}]")
+        print(f"    [{cm_b[1][0]}  {cm_b[1][1]}]")
+        prec_b = binge_results[binge_best_name].get("precision")
+        rec_b = binge_results[binge_best_name].get("recall")
+        spec_b = binge_results[binge_best_name].get("specificity")
+        f1_b = binge_results[binge_best_name].get("f1")
+        print(
+            "  Análise: "
+            f"Precisão={prec_b:.3f} | Recall={rec_b:.3f} | Especificidade={spec_b:.3f} | F1={f1_b:.3f}"
+        )
 
     print("Alvo: Fumante atual")
     for line in _fmt_res(smoke_results):
         print(line)
+    smoke_best_val = smoke_results[smoke_best_name]["val_acc"] * 100
     print(
-        f"  -> Melhor (por Test Accuracy): {smoke_best_name} ({smoke_best_acc*100:.2f}%)"
+        f"  -> Melhor: {smoke_best_name} (Val {smoke_best_val:.2f}% | Test {smoke_best_acc*100:.2f}%)"
     )
+    cm_s = smoke_results[smoke_best_name].get("confusion_matrix")
+    if cm_s:
+        print("  Matriz de confusão (Teste) [verdadeiro 0/1 x previsto 0/1]:")
+        print(f"    [{cm_s[0][0]}  {cm_s[0][1]}]")
+        print(f"    [{cm_s[1][0]}  {cm_s[1][1]}]")
+        prec_s = smoke_results[smoke_best_name].get("precision")
+        rec_s = smoke_results[smoke_best_name].get("recall")
+        spec_s = smoke_results[smoke_best_name].get("specificity")
+        f1_s = smoke_results[smoke_best_name].get("f1")
+        print(
+            "  Análise: "
+            f"Precisão={prec_s:.3f} | Recall={rec_s:.3f} | Especificidade={spec_s:.3f} | F1={f1_s:.3f}"
+        )
 
     print(
         "Observação: accuracy em %; dataset: BRFSS 2015; ausentes tratados por coluna "
