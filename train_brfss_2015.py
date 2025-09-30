@@ -813,10 +813,6 @@ def main() -> None:
     _print_target_block("Binge", binge_results, binge_best_name, binge_best_acc)
     _print_target_block("Fumante atual", smoke_results, smoke_best_name, smoke_best_acc)
 
-    print(
-        "\nObservações: accuracy em %; dataset BRFSS 2015; ausentes tratados por coluna "
-        "via regras específicas e heurística segura."
-    )
 
 
 if __name__ == "__main__":
