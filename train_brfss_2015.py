@@ -8,16 +8,15 @@ Objetivo: Treinar modelos para dois alvos no BRFSS 2015 (binge drinking e fumant
 com pipeline de pré-processamento e salvar os artefatos. O script imprime mensagens
 didáticas no formato "PASSO X: ..." ao longo do processo.
 
-Observação importante: códigos de não resposta variam por coluna. A fonte de verdade são
-os metadados do arquivo JSON (2015_formats.json) e o PDF “dados do dataset.pdf”. Este
-script respeita a especificidade por coluna quando o JSON está disponível; caso contrário,
-aplica heurísticas seguras apenas aos códigos presentes em cada coluna.
+Observação importante: códigos de não resposta variam por coluna. Este
+script aplica regras específicas por coluna (limpeza manual) e uma heurística
+segura por coluna baseada em códigos clássicos presentes em cada coluna. Não há
+dependência de JSON externo.
 """
 
 from __future__ import annotations
 
 import os
-import json
 import warnings
 from typing import Dict, Set, Tuple, Any, List
 
@@ -85,106 +84,30 @@ def read_dataset(csv_path: str) -> pd.DataFrame:
     return pd.read_csv(csv_path, low_memory=False)
 
 
-def load_formats_json(json_path: str) -> Dict[str, Any] | None:
-    if not os.path.exists(json_path):
-        return None
-    try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        # Se o JSON estiver inválido, ignore de forma segura.
-        return None
-
-
-def build_missing_map(
-    df: pd.DataFrame, fmt_json: Dict[str, Any] | None
-) -> Dict[str, Set[Any]]:
+def build_missing_map(df: pd.DataFrame) -> Dict[str, Set[Any]]:
     """
     Constrói um mapa coluna->conjunto de códigos a serem tratados como ausentes (NaN).
 
-    - Se houver JSON de formatos (2015_formats.json), usa rótulos que indicam não resposta
-      (e.g., "Don't know", "Refused", "Missing", "Unknown") para coletar os códigos por coluna.
-    - Caso contrário, aplica heurística segura por coluna: somente adiciona aos ausentes
-      os códigos clássicos que existirem naquela coluna (p.ex. {7,9,77,88,99,555,777,888,999}).
-
-    Importante: os códigos de não resposta variam por coluna; JAMAS aplicar um conjunto
-    genérico a todas as colunas sem verificar presença na coluna.
+    Heurística segura por coluna: adiciona aos ausentes somente os códigos
+    clássicos que existirem naquela coluna (e.g. {7,9,77,88,99,555,777,888,999}).
     """
     missing_map: Dict[str, Set[Any]] = {c: set() for c in df.columns}
 
     classic_codes = {7, 9, 77, 88, 99, 555, 777, 888, 999}
     classic_str = {str(x) for x in classic_codes}
 
-    keywords = [
-        "don't know",
-        "dont know",
-        "refused",
-        "missing",
-        "unknown",
-        "not ascertained",
-        "dk",
-        "na",
-        "blank",
-        "illegible",
-    ]
+    for col in df.columns:
+        try:
+            uniques = set(pd.Series(df[col]).dropna().unique().tolist())
+        except Exception:
+            uniques = set()
 
-    if fmt_json is not None and isinstance(fmt_json, dict):
-        # Tentar inferir estrutura: col -> {code->label} ou col -> {"values": {code->label}} etc.
-        for col in df.columns:
-            try:
-                meta = fmt_json.get(col)
-                if meta is None:
-                    continue
-
-                # Diversas formas possíveis
-                if isinstance(meta, dict):
-                    # 1) Pode ser diretamente {code: label}
-                    candidates = meta
-                    # 2) Ou aninhado sob algumas chaves comuns
-                    for key in [
-                        "values",
-                        "codes",
-                        "labels",
-                        "mapping",
-                        "map",
-                        "value_labels",
-                    ]:
-                        if key in meta and isinstance(meta[key], dict):
-                            candidates = meta[key]
-                            break
-
-                    for k, v in candidates.items():
-                        # Tentar normalizar o código (k) e rótulo (v)
-                        try:
-                            code = int(k)
-                        except Exception:
-                            code = k
-
-                        label = str(v).strip().lower()
-
-                        if any(word in label for word in keywords) or (
-                            str(k).strip() in classic_str
-                        ):
-                            missing_map[col].add(code)
-            except Exception:
-                # Seja resiliente a inconsistências
-                continue
-
-    else:
-        # Heurística segura: por coluna, somente códigos clássicos existentes.
-        for col in df.columns:
-            try:
-                uniques = set(pd.Series(df[col]).dropna().unique().tolist())
-            except Exception:
-                uniques = set()
-
-            # Adicionar apenas os que existem na coluna (numérico e string)
-            for code in classic_codes:
-                if code in uniques:
-                    missing_map[col].add(code)
-            for code in classic_str:
-                if code in uniques:
-                    missing_map[col].add(code)
+        for code in classic_codes:
+            if code in uniques:
+                missing_map[col].add(code)
+        for code in classic_str:
+            if code in uniques:
+                missing_map[col].add(code)
 
     return missing_map
 
@@ -232,6 +155,51 @@ def apply_manual_cleaning(df: pd.DataFrame) -> pd.DataFrame:
             df_clean[col] = df_clean[col].replace(mapping)
 
     return df_clean
+
+
+def remove_outliers_iqr(
+    df: pd.DataFrame, numeric_cols: Set[str], multiplier: float = 1.5
+) -> Tuple[pd.DataFrame, int]:
+    """Remove linhas com outliers (método IQR) nas colunas numéricas informadas."""
+    if not numeric_cols:
+        return df.copy(), 0
+
+    mask = pd.Series(True, index=df.index)
+
+    for col in numeric_cols:
+        if col not in df.columns:
+            continue
+
+        series = pd.to_numeric(df[col], errors="coerce")
+        q1 = series.quantile(0.25)
+        q3 = series.quantile(0.75)
+
+        if pd.isna(q1) or pd.isna(q3):
+            continue
+
+        iqr = q3 - q1
+        if iqr == 0:
+            continue
+
+        lower = q1 - multiplier * iqr
+        upper = q3 + multiplier * iqr
+        col_mask = series.isna() | ((series >= lower) & (series <= upper))
+        mask &= col_mask
+
+    filtered_df = df.loc[mask].copy()
+    removed_rows = int((~mask).sum())
+    return filtered_df, removed_rows
+
+
+def filter_target_rows(
+    df: pd.DataFrame, y: pd.Series, feature_cols: List[str]
+) -> Tuple[pd.DataFrame, pd.Series, int]:
+    """Retira linhas com target ausente e devolve subconjunto pronto para treino."""
+    mask = y.notna()
+    filtered_X = df.loc[mask, feature_cols].copy()
+    filtered_y = y.loc[mask].astype(int)
+    removed_rows = int((~mask).sum())
+    return filtered_X, filtered_y, removed_rows
 
 
 def derive_targets(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, List[str]]:
@@ -401,9 +369,12 @@ def fit_and_evaluate(
     - Treina e avalia modelos, devolve resultados e o melhor por Test Accuracy
     """
     # Filtrar apenas registros com y válido
-    mask = y.notna()
-    df_ = df.loc[mask, cat_cols + num_cols].copy()
-    y_ = y.loc[mask].astype(int)
+    feature_cols = cat_cols + num_cols
+    df_, y_, removed_rows = filter_target_rows(df, y, feature_cols)
+
+    log(
+        f"Linhas com target ausente removidas para {target_name}: {removed_rows}."
+    )
 
     # Split 85/15 para treino+val e teste
     X_train_val, X_test, y_train_val, y_test = skms.train_test_split(
@@ -474,14 +445,18 @@ def main() -> None:
     log("Aplicando limpeza manual nas colunas selecionadas…")
     df = apply_manual_cleaning(df)
 
-    # Ler metadados e construir mapa de ausentes
-    log("Lendo 2015_formats.json (se disponível) para mapear códigos ausentes por coluna…")
-    json_path = os.path.join("data", "2015_formats.json")
-    fmt_json = load_formats_json(json_path)
-
-    missing_map = build_missing_map(df, fmt_json)
+    # Construir e aplicar mapa de ausentes (heurística por coluna)
+    log("Mapeando códigos de não resposta por coluna (heurística segura)…")
+    missing_map = build_missing_map(df)
     df = apply_missing_map(df, missing_map)
-    log("Ausentes tratados respeitando a especificidade por coluna.")
+    log("Ausentes tratados respeitando a especificidade por coluna (heurística).")
+
+    df, removed_outliers = remove_outliers_iqr(df, NUMERIC_SELECTED)
+    numeric_list = ", ".join(sorted(NUMERIC_SELECTED))
+    log(
+        "Remoção de outliers concluída nas colunas numéricas selecionadas "
+        f"({numeric_list}); {removed_outliers} linhas eliminadas."
+    )
 
     # Construção dos alvos
     log("Construindo os alvos (Binge e Fumante atual)…")
@@ -547,8 +522,8 @@ def main() -> None:
     )
 
     print(
-        "Observação: accuracy em %; dataset: BRFSS 2015; ausentes tratados por coluna conforme "
-        "formatos/JSON e PDF."
+        "Observação: accuracy em %; dataset: BRFSS 2015; ausentes tratados por coluna "
+        "via regras específicas e heurística segura."
     )
 
 
