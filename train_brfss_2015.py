@@ -368,9 +368,10 @@ def get_models(mode: str = "full") -> Dict[str, Any]:
                 solver="liblinear",
                 random_state=RANDOM_STATE,
             ),
-            # Opção rápida: RF menor
             "RF": ensemble.RandomForestClassifier(
-                n_estimators=100,
+                n_estimators=200,
+                max_depth=20,
+                max_features="sqrt",
                 class_weight="balanced_subsample",
                 random_state=RANDOM_STATE,
                 n_jobs=-1,
@@ -381,7 +382,9 @@ def get_models(mode: str = "full") -> Dict[str, Any]:
             max_iter=200, class_weight="balanced", solver="liblinear", random_state=RANDOM_STATE
         ),
         "RF": ensemble.RandomForestClassifier(
-            n_estimators=400,
+            n_estimators=500,
+            max_depth=25,
+            max_features="sqrt",
             class_weight="balanced_subsample",
             random_state=RANDOM_STATE,
             n_jobs=-1,
