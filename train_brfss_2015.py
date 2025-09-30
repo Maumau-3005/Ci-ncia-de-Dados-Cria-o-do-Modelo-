@@ -51,6 +51,20 @@ warnings.simplefilter("ignore")
 RANDOM_STATE = 42
 
 
+def _fmt_pct(value: float | None) -> str:
+    if value is None or np.isnan(value):
+        return "--"
+    return f"{value*100:.2f}%"
+
+
+def _print_confusion_matrix(matrix: List[List[int]]) -> None:
+    if not matrix or len(matrix) != 2 or any(len(row) != 2 for row in matrix):
+        return
+    print("    Matriz de confusão (linhas=real 0/1, colunas=prev 0/1)")
+    print(f"      [TN={matrix[0][0]:>6}  FP={matrix[0][1]:>6}]")
+    print(f"      [FN={matrix[1][0]:>6}  TP={matrix[1][1]:>6}]")
+
+
 # Lista de colunas selecionadas manualmente para o treinamento
 SELECTED_FEATURES = [
     "_AGE_G",
@@ -226,7 +240,8 @@ def create_balanced_sample(
     negative_label: float = 0.0,
     per_class: int = 25000,
     random_state: int = RANDOM_STATE,
-) -> Tuple[pd.DataFrame, pd.Series, int]:
+    holdout_ratio: float = 0.1,
+) -> Tuple[pd.DataFrame, pd.Series, int, np.ndarray]:
     """Seleciona amostra balanceada 50/50 entre classes positiva e negativa."""
 
     valid_mask = y.isin([positive_label, negative_label])
@@ -235,13 +250,20 @@ def create_balanced_sample(
     pos_idx = y_valid[y_valid == positive_label].index
     neg_idx = y_valid[y_valid == negative_label].index
 
-    actual_per_class = min(per_class, len(pos_idx), len(neg_idx))
+    holdout_ratio = min(max(holdout_ratio, 0.0), 0.5)
+    holdout_pos = max(1, int(len(pos_idx) * holdout_ratio)) if len(pos_idx) > 0 else 0
+    holdout_neg = max(1, int(len(neg_idx) * holdout_ratio)) if len(neg_idx) > 0 else 0
+
+    available_pos = len(pos_idx) - holdout_pos
+    available_neg = len(neg_idx) - holdout_neg
+
+    actual_per_class = min(per_class, available_pos, available_neg)
 
     if actual_per_class <= 0:
         raise ValueError(
             "Não há amostras suficientes para balanceamento: "
             f"positivos disponíveis={len(pos_idx)}, negativos disponíveis={len(neg_idx)}, "
-            f"necessário por classe={per_class}."
+            f"necessário por classe={per_class} após reservar {holdout_pos} positivos e {holdout_neg} negativos para teste."
         )
 
     rng = np.random.default_rng(random_state)
@@ -251,7 +273,12 @@ def create_balanced_sample(
     selected_idx = np.concatenate([pos_sample, neg_sample])
     rng.shuffle(selected_idx)
 
-    return df.loc[selected_idx].copy(), y.loc[selected_idx].copy(), actual_per_class
+    return (
+        df.loc[selected_idx].copy(),
+        y.loc[selected_idx].copy(),
+        actual_per_class,
+        selected_idx,
+    )
 
 
 def derive_targets(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, List[str]]:
@@ -420,12 +447,14 @@ def fit_and_evaluate(
     models: Dict[str, Any],
     test_size: float | int = 0.15,
     val_fraction_within_train: float = 15 / 85,
+    external_X_test: pd.DataFrame | None = None,
+    external_y_test: pd.Series | None = None,
 ) -> Tuple[Dict[str, Dict[str, float]], Tuple[str, float, Pipeline]]:
     """
     - Filtra linhas com y ausente
     - Split estratificado conforme parâmetros (test_size pode ser fração ou inteiro)
     - Treina e avalia modelos, devolve resultados e o melhor selecionado por Val Accuracy
-      (Test Accuracy reportado apenas após ajuste em treino+val)
+      (Test Accuracy reportado após ajuste final; se external_X_test estiver definido, usa-o)
     """
     # Filtrar apenas registros com y válido
     feature_cols = cat_cols + num_cols
@@ -495,11 +524,22 @@ def fit_and_evaluate(
     )
     final_pipe.fit(X_train_val, y_train_val)
 
-    final_test_pred = final_pipe.predict(X_test)
-    final_test_acc = metrics.accuracy_score(y_test, final_test_pred)
+    eval_X = X_test
+    eval_y = y_test
+    eval_desc = "teste interno estratificado"
+    if external_X_test is not None and external_y_test is not None:
+        eval_X = external_X_test
+        eval_y = external_y_test
+        eval_desc = "teste externo"
+        log(
+            f"Executando avaliação externa para {target_name} com {len(eval_X)} registros."
+        )
+
+    final_test_pred = final_pipe.predict(eval_X)
+    final_test_acc = metrics.accuracy_score(eval_y, final_test_pred)
     try:
-        final_test_scores = _proba_or_score(final_pipe, X_test)
-        final_test_auc = metrics.roc_auc_score(y_test, final_test_scores)
+        final_test_scores = _proba_or_score(final_pipe, eval_X)
+        final_test_auc = metrics.roc_auc_score(eval_y, final_test_scores)
     except Exception:
         final_test_auc = np.nan
 
@@ -509,7 +549,7 @@ def fit_and_evaluate(
     )
 
     try:
-        cm = metrics.confusion_matrix(y_test, final_test_pred, labels=[0, 1])
+        cm = metrics.confusion_matrix(eval_y, final_test_pred, labels=[0, 1])
         if cm.shape == (2, 2):
             tn, fp, fn, tp = cm.ravel()
         else:
@@ -538,8 +578,8 @@ def fit_and_evaluate(
 
     print(
         f"Modelo selecionado (validação)={best_name} | Alvo={target_name.upper()} | "
-        f"Val Accuracy={best_val_acc*100:.2f}% | Test Accuracy (reajustado)={final_test_acc*100:.2f}% | "
-        f"Test ROC-AUC (reajustado)={(final_test_auc*100 if not np.isnan(final_test_auc) else np.nan):.2f}"
+        f"Val Accuracy={best_val_acc*100:.2f}% | {eval_desc.title()} Accuracy={final_test_acc*100:.2f}% | "
+        f"{eval_desc.title()} ROC-AUC={(final_test_auc*100 if not np.isnan(final_test_auc) else np.nan):.2f}"
     )
 
     return results, (best_name, float(final_test_acc), final_pipe)
@@ -571,6 +611,12 @@ def main() -> None:
         type=float,
         default=0.2,
         help="Fração do conjunto de treino (após balancear Binge) destinada à validação.",
+    )
+    parser.add_argument(
+        "--balanced-binge-holdout",
+        type=float,
+        default=0.1,
+        help="Proporção mínima por classe reservada para o teste externo de Binge (0-0.5).",
     )
     args = parser.parse_args()
     # Carregar dados
@@ -633,13 +679,14 @@ def main() -> None:
             "Gerando amostra balanceada para Binge (" \
             f"{per_class} positivos e {per_class} negativos; total={total_requested})…"
         )
-        binge_df, binge_y, actual_per_class = create_balanced_sample(
+        binge_df, binge_y, actual_per_class, binge_selected_idx = create_balanced_sample(
             df,
             y_binge,
             positive_label=1.0,
             negative_label=0.0,
             per_class=per_class,
             random_state=RANDOM_STATE,
+            holdout_ratio=args.balanced_binge_holdout,
         )
 
         total_selected = actual_per_class * 2
@@ -649,7 +696,13 @@ def main() -> None:
                 f"utilizando total={total_selected}."
             )
 
-        train_target = min(args.balanced_binge_train, total_selected - 1)
+        internal_test_min_frac = 0.1
+        min_test_required = max(2, int(total_selected * internal_test_min_frac))
+        if total_selected <= min_test_required:
+            raise ValueError(
+                "Amostra balanceada para Binge é muito pequena para separar treino e teste internos."
+            )
+        train_target = min(args.balanced_binge_train, total_selected - min_test_required)
         if train_target <= 0:
             raise ValueError(
                 "balanced-binge-train deve ser positivo e menor que o total selecionado."
@@ -665,6 +718,28 @@ def main() -> None:
             f"teste={binge_test_size}. Validação dentro do treino: {binge_val_fraction*100:.2f}%"
         )
 
+    binge_external_X: pd.DataFrame | None = None
+    binge_external_y: pd.Series | None = None
+
+    if args.balanced_binge:
+        valid_idx = df.loc[y_binge.notna()].index
+        selected_idx = pd.Index(binge_selected_idx)
+        remaining_idx = valid_idx.difference(selected_idx)
+        if remaining_idx.empty:
+            raise ValueError(
+                "Após separar o conjunto balanceado de treino, não restaram dados para teste externo."
+            )
+        binge_external_X = df.loc[remaining_idx, cat_cols + num_cols].copy()
+        binge_external_y = y_binge.loc[remaining_idx].astype(int)
+        log(
+            f"Teste externo de Binge utilizará {len(binge_external_X)} registros (complemento do balanceado)."
+        )
+
+    else:
+        binge_eval_mask = y_binge.notna()
+        binge_external_X = df.loc[binge_eval_mask, cat_cols + num_cols].copy()
+        binge_external_y = y_binge.loc[binge_eval_mask].astype(int)
+
     log("Treinando e avaliando modelos para Binge…")
     binge_results, (binge_best_name, binge_best_acc, binge_best_pipe) = fit_and_evaluate(
         binge_df,
@@ -676,6 +751,8 @@ def main() -> None:
         models=models,
         test_size=binge_test_size,
         val_fraction_within_train=binge_val_fraction,
+        external_X_test=binge_external_X,
+        external_y_test=binge_external_y,
     )
 
     log("Treinando e avaliando modelos para Fumante atual…")
@@ -692,63 +769,52 @@ def main() -> None:
     dump(smoke_best_pipe, os.path.join("models", "smoker_current_model.joblib"))
 
     # Relatório final amigável
-    print("===== RESUMO =====")
-    def _fmt_res(res: Dict[str, Dict[str, float]]) -> List[str]:
-        lines = []
-        for name in sorted(res.keys()):
-            v = res[name]
-            test_display = "--"
-            if not np.isnan(v["test_acc"]):
-                test_display = f"{v['test_acc']*100:.2f}%"
-            lines.append(
-                f"  - {name}: Val {v['val_acc']*100:.2f}% | Test {test_display}"
+    print("\n========== RESULTADOS ==========")
+
+    def _print_target_block(
+        label: str,
+        results: Dict[str, Dict[str, float]],
+        best_name: str,
+        best_acc: float,
+    ) -> None:
+        print(f"\n>> {label.upper()}")
+        print("  Modelos avaliados:")
+        for name in sorted(results.keys()):
+            metrics_map = results[name]
+            val_txt = _fmt_pct(metrics_map.get("val_acc"))
+            test_txt = _fmt_pct(metrics_map.get("test_acc"))
+            auc_txt = _fmt_pct(metrics_map.get("test_auc"))
+            print(f"    - {name:<30} | Val={val_txt:<8} Test={test_txt:<8} ROC-AUC={auc_txt:<8}")
+
+        best_metrics = results[best_name]
+        print(f"\n  Melhor modelo: {best_name}")
+        print(
+            "    → Val={val} | Test={test} | ROC-AUC={auc}"
+            .format(
+                val=_fmt_pct(best_metrics.get("val_acc")),
+                test=_fmt_pct(best_metrics.get("test_acc")),
+                auc=_fmt_pct(best_metrics.get("test_auc")),
             )
-        return lines
-
-    print("Alvo: Binge")
-    for line in _fmt_res(binge_results):
-        print(line)
-    binge_best_val = binge_results[binge_best_name]["val_acc"] * 100
-    print(
-        f"  -> Melhor: {binge_best_name} (Val {binge_best_val:.2f}% | Test {binge_best_acc*100:.2f}%)"
-    )
-    cm_b = binge_results[binge_best_name].get("confusion_matrix")
-    if cm_b:
-        print("  Matriz de confusão (Teste) [verdadeiro 0/1 x previsto 0/1]:")
-        print(f"    [{cm_b[0][0]}  {cm_b[0][1]}]")
-        print(f"    [{cm_b[1][0]}  {cm_b[1][1]}]")
-        prec_b = binge_results[binge_best_name].get("precision")
-        rec_b = binge_results[binge_best_name].get("recall")
-        spec_b = binge_results[binge_best_name].get("specificity")
-        f1_b = binge_results[binge_best_name].get("f1")
-        print(
-            "  Análise: "
-            f"Precisão={prec_b:.3f} | Recall={rec_b:.3f} | Especificidade={spec_b:.3f} | F1={f1_b:.3f}"
         )
 
-    print("Alvo: Fumante atual")
-    for line in _fmt_res(smoke_results):
-        print(line)
-    smoke_best_val = smoke_results[smoke_best_name]["val_acc"] * 100
-    print(
-        f"  -> Melhor: {smoke_best_name} (Val {smoke_best_val:.2f}% | Test {smoke_best_acc*100:.2f}%)"
-    )
-    cm_s = smoke_results[smoke_best_name].get("confusion_matrix")
-    if cm_s:
-        print("  Matriz de confusão (Teste) [verdadeiro 0/1 x previsto 0/1]:")
-        print(f"    [{cm_s[0][0]}  {cm_s[0][1]}]")
-        print(f"    [{cm_s[1][0]}  {cm_s[1][1]}]")
-        prec_s = smoke_results[smoke_best_name].get("precision")
-        rec_s = smoke_results[smoke_best_name].get("recall")
-        spec_s = smoke_results[smoke_best_name].get("specificity")
-        f1_s = smoke_results[smoke_best_name].get("f1")
+        _print_confusion_matrix(best_metrics.get("confusion_matrix", []))
+
         print(
-            "  Análise: "
-            f"Precisão={prec_s:.3f} | Recall={rec_s:.3f} | Especificidade={spec_s:.3f} | F1={f1_s:.3f}"
+            "    Métricas complementares: Precisão={p:.3f} | Recall={r:.3f} | "
+            "Especificidade={s:.3f} | F1={f:.3f}"
+            .format(
+                p=best_metrics.get("precision", float("nan")),
+                r=best_metrics.get("recall", float("nan")),
+                s=best_metrics.get("specificity", float("nan")),
+                f=best_metrics.get("f1", float("nan")),
+            )
         )
 
+    _print_target_block("Binge", binge_results, binge_best_name, binge_best_acc)
+    _print_target_block("Fumante atual", smoke_results, smoke_best_name, smoke_best_acc)
+
     print(
-        "Observação: accuracy em %; dataset: BRFSS 2015; ausentes tratados por coluna "
+        "\nObservações: accuracy em %; dataset BRFSS 2015; ausentes tratados por coluna "
         "via regras específicas e heurística segura."
     )
 
