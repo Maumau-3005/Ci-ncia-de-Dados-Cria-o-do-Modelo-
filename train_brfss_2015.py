@@ -736,9 +736,10 @@ def main() -> None:
         )
 
     else:
-        binge_eval_mask = y_binge.notna()
-        binge_external_X = df.loc[binge_eval_mask, cat_cols + num_cols].copy()
-        binge_external_y = y_binge.loc[binge_eval_mask].astype(int)
+        # Sem balanceamento: use apenas o teste interno estratificado.
+        # Definir um teste externo aqui incluiria dados de treino na avaliação final.
+        binge_external_X = None
+        binge_external_y = None
 
     log("Treinando e avaliando modelos para Binge…")
     binge_results, (binge_best_name, binge_best_acc, binge_best_pipe) = fit_and_evaluate(
