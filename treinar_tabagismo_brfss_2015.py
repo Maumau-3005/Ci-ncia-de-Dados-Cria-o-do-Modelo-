@@ -324,17 +324,17 @@ def selecionar_variaveis(
         if leak in features:
             features.remove(leak)
 
-    cat_cols: List[str] = []
-    num_cols: List[str] = []
+    colunas_categoricas: List[str] = []
+    colunas_numericas: List[str] = []
 
     for c in features:
         if c in COLUNAS_NUMERICAS:
-            num_cols.append(c)
+            colunas_numericas.append(c)
         else:
             # Demais tratadas como categóricas (incluindo codificadas numericamente)
-            cat_cols.append(c)
+            colunas_categoricas.append(c)
 
-    return cat_cols, num_cols
+    return colunas_categoricas, colunas_numericas
 
 
 def preparar_dados_fumante(
@@ -625,7 +625,7 @@ def main() -> None:
     log("Ausentes tratados respeitando a especificidade por coluna (heurística).")
 
     log("Preparando dataset limpo para o alvo fumante atual…")
-    X_full, y_full, cat_cols, num_cols = preparar_dados_fumante(df)
+    X_full, y_full, colunas_categoricas, colunas_numericas = preparar_dados_fumante(df)
     total = len(y_full)
     total_fumantes = int((y_full == 1).sum())
     total_nao_fumantes = int((y_full == 0).sum())
@@ -664,7 +664,7 @@ def main() -> None:
     log(
         "Montando pipeline de pré-processamento (imputação + clipping IQR + one-hot + padronização)…"
     )
-    preprocessador = montar_preprocessamento(cat_cols, num_cols)
+    preprocessador = montar_preprocessamento(colunas_categoricas, colunas_numericas)
 
     modelos = obter_modelos("quick" if args.quick else "full")
 
@@ -673,8 +673,8 @@ def main() -> None:
         X_bal,
         y_bal,
         preprocessador,
-        cat_cols,
-        num_cols,
+        colunas_categoricas,
+        colunas_numericas,
         nome_alvo="Fumante atual",
         modelos=modelos,
         teste_externo_X=X_externo,
