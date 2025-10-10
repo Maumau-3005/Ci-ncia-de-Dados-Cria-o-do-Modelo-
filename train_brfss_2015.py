@@ -30,7 +30,6 @@ from sklearn import model_selection as skms
 from sklearn import compose
 from sklearn import preprocessing as skprep
 from sklearn import impute
-from sklearn import linear_model
 from sklearn import ensemble
 from sklearn.pipeline import Pipeline
 from sklearn.base import BaseEstimator, TransformerMixin, clone
@@ -394,12 +393,6 @@ def get_models(mode: str = "full") -> Dict[str, Any]:
     mode = (mode or "full").lower()
     if mode == "quick":
         return {
-            "LogReg": linear_model.LogisticRegression(
-                max_iter=200,
-                class_weight="balanced",
-                solver="liblinear",
-                random_state=RANDOM_STATE,
-            ),
             "RF": ensemble.RandomForestClassifier(
                 n_estimators=200,
                 max_depth=20,
@@ -408,11 +401,9 @@ def get_models(mode: str = "full") -> Dict[str, Any]:
                 random_state=RANDOM_STATE,
                 n_jobs=-1,
             ),
+            "GB": ensemble.GradientBoostingClassifier(random_state=RANDOM_STATE),
         }
     return {
-        "LogReg": linear_model.LogisticRegression(
-            max_iter=200, class_weight="balanced", solver="liblinear", random_state=RANDOM_STATE
-        ),
         "RF": ensemble.RandomForestClassifier(
             n_estimators=500,
             max_depth=25,

@@ -44,7 +44,7 @@ Durante o treinamento:
 
 1. Linhas com valores ausentes no alvo ou nas features são removidas.
 2. O dataset é balanceado para garantir a mesma quantidade de fumantes e não fumantes.
-3. Diversos classificadores são avaliados e o melhor (pela validação interna) é ajustado em treino+validação.
+3. Dois classificadores supervisionados (`RandomForestClassifier` e `GradientBoostingClassifier`) são avaliados e o melhor (pela validação interna) é ajustado em treino+validação.
 4. O desempenho final é reportado (teste interno e opcionalmente externo) com métricas, matriz de confusão e importâncias de variáveis (permutation importance).
 
 O artefato treinado é salvo em:
