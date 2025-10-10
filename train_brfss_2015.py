@@ -35,6 +35,7 @@ from sklearn import ensemble
 from sklearn.pipeline import Pipeline
 from sklearn.base import BaseEstimator, TransformerMixin, clone
 
+from model_metrics import classification_metrics, proba_or_score
 # ==========================
 # Utilitário de logging
 # ==========================
@@ -420,23 +421,6 @@ def get_models(mode: str = "full") -> Dict[str, Any]:
     }
 
 
-def _proba_or_score(clf, X) -> np.ndarray:
-    if hasattr(clf, "predict_proba"):
-        proba = clf.predict_proba(X)
-        if isinstance(proba, list):
-            proba = proba[0]
-        # Prob da classe positiva
-        return proba[:, 1]
-    if hasattr(clf, "decision_function"):
-        scores = clf.decision_function(X)
-        # Normalizar para 0-1 via min-max caso necessário
-        scores = (scores - scores.min()) / (scores.max() - scores.min() + 1e-9)
-        return scores
-    # Fallback: usar previsões binárias
-    preds = clf.predict(X)
-    return preds.astype(float)
-
-
 def fit_and_evaluate(
     df: pd.DataFrame,
     y: pd.Series,
@@ -536,45 +520,25 @@ def fit_and_evaluate(
         )
 
     final_test_pred = final_pipe.predict(eval_X)
-    final_test_acc = metrics.accuracy_score(eval_y, final_test_pred)
     try:
-        final_test_scores = _proba_or_score(final_pipe, eval_X)
-        final_test_auc = metrics.roc_auc_score(eval_y, final_test_scores)
+        final_test_scores = proba_or_score(final_pipe, eval_X)
     except Exception:
-        final_test_auc = np.nan
+        final_test_scores = None
 
-    results[best_name]["test_acc"] = float(final_test_acc)
-    results[best_name]["test_auc"] = (
-        float(final_test_auc) if not np.isnan(final_test_auc) else np.nan
+    metric_summary = classification_metrics(
+        eval_y, final_test_pred, scores=final_test_scores
     )
 
-    try:
-        cm = metrics.confusion_matrix(eval_y, final_test_pred, labels=[0, 1])
-        if cm.shape == (2, 2):
-            tn, fp, fn, tp = cm.ravel()
-        else:
-            tn = fp = fn = tp = 0
-            cm = np.array([[0, 0], [0, 0]])
-    except Exception:
-        tn = fp = fn = tp = 0
-        cm = np.array([[0, 0], [0, 0]])
+    final_test_acc = metric_summary["accuracy"]
+    final_test_auc = metric_summary["roc_auc"]
 
-    def _safe_div(a: int, b: int) -> float:
-        return float(a / b) if b else float("nan")
-
-    precision = _safe_div(tp, tp + fp)
-    recall = _safe_div(tp, tp + fn)
-    specificity = _safe_div(tn, tn + fp)
-    f1 = _safe_div(2 * tp, 2 * tp + fp + fn)
-
-    results[best_name]["confusion_matrix"] = [
-        [int(cm[0, 0]), int(cm[0, 1])],
-        [int(cm[1, 0]), int(cm[1, 1])],
-    ]
-    results[best_name]["precision"] = precision
-    results[best_name]["recall"] = recall
-    results[best_name]["specificity"] = specificity
-    results[best_name]["f1"] = f1
+    results[best_name]["test_acc"] = final_test_acc
+    results[best_name]["test_auc"] = final_test_auc
+    results[best_name]["confusion_matrix"] = metric_summary["confusion_matrix"]
+    results[best_name]["precision"] = metric_summary["precision"]
+    results[best_name]["recall"] = metric_summary["recall"]
+    results[best_name]["specificity"] = metric_summary["specificity"]
+    results[best_name]["f1"] = metric_summary["f1"]
 
     print(
         f"Modelo selecionado (validação)={best_name} | Alvo={target_name.upper()} | "
