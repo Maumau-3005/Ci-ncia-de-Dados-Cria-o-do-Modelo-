@@ -1,16 +1,16 @@
-# Ciência de Dados — Criação do Modelo
+# Ciência de Dados — Tabagismo BRFSS 2015
 
-Este projeto treina e avalia dois modelos de classificação binária usando o BRFSS 2015:
-
-- Binge drinking (consumo excessivo de álcool)
-- Fumante atual
-
-O pipeline inclui limpeza específica por coluna, tratamento de ausentes, derivação dos alvos, pré-processamento (categóricas e numéricas) e treino/validação/teste. Os modelos treinados são salvos como pipelines prontos para inferência.
+Este projeto treina e avalia um modelo de classificação binária para identificar
+fumantes atuais (`_SMOKER3`) no BRFSS 2015. O pipeline aplica limpeza específica
+por coluna, trata códigos de não resposta, remove linhas com valores ausentes,
+balanceia o conjunto 50/50 entre fumantes e não fumantes e treina diferentes
+classificadores. O melhor modelo é salvo como um pipeline do scikit-learn pronto
+para inferência, juntamente com métricas e importâncias de variáveis.
 
 ## Requisitos
 
 - Python 3.10+
-- Instalar dependências:
+- Instalar as dependências:
 
 ```
 pip install -r requirements.txt
@@ -18,71 +18,65 @@ pip install -r requirements.txt
 
 ## Dados
 
-Coloque o arquivo do BRFSS 2015 em `data/2015.csv`.
+Coloque o arquivo BRFSS 2015 em `data/2015.csv`.
 
-As colunas necessárias são um subconjunto definido no código (`SELECTED_FEATURES`) e as colunas de alvo `_RFDRHV5` (binge) e `_SMOKER3` (fumante). O script valida a presença dessas colunas.
+As colunas necessárias são o conjunto definido em `SELECTED_FEATURES` e a coluna
+de alvo `_SMOKER3`. O script valida a presença dessas colunas antes de iniciar o
+treinamento.
 
 ## Treinamento
 
-Com modelos “full” (padrão):
+Executa o pipeline completo:
 
 ```
 python train_brfss_2015.py
 ```
 
-Execução rápida (modelos mais leves):
+Opções úteis:
 
-```
-python train_brfss_2015.py --quick
-```
+- `--dataset PATH` — caminho alternativo para o CSV.
+- `--sample N` — amostragem aleatória de N linhas para execuções rápidas.
+- `--quick` — usa hiperparâmetros mais leves.
+- `--balance-per-class N` — número máximo de registros por classe após o balanceamento 50/50.
+- `--balance-holdout F` — fração mínima (0–0.5) reservada para teste externo após balancear.
 
-Amostragem de N linhas para acelerar:
+Durante o treinamento:
 
-```
-python train_brfss_2015.py --sample 50000
-```
+1. Linhas com valores ausentes no alvo ou nas features são removidas.
+2. O dataset é balanceado para garantir a mesma quantidade de fumantes e não fumantes.
+3. Diversos classificadores são avaliados e o melhor (pela validação interna) é ajustado em treino+validação.
+4. O desempenho final é reportado (teste interno e opcionalmente externo) com métricas, matriz de confusão e importâncias de variáveis (permutation importance).
 
-Balancear o alvo de Binge (50/50) com teste externo:
+O artefato treinado é salvo em:
 
-```
-python train_brfss_2015.py \
-  --balanced-binge \
-  --balanced-binge-size 25000 \
-  --balanced-binge-train 40000 \
-  --balanced-binge-val-frac 0.2 \
-  --balanced-binge-holdout 0.1
-```
-
-Ao final, os modelos são salvos em:
-
-- `models/alcohol_binge_model.joblib`
 - `models/smoker_current_model.joblib`
 
-## Avaliação (modelos salvos)
+## Avaliação
 
-Avalia ambos os modelos salvos em conjunto, reutilizando a mesma limpeza e derivação de alvos do treino:
+A avaliação reutiliza as mesmas etapas de limpeza e preparação para medir o desempenho do modelo salvo:
 
 ```
 python scripts/evaluate_models.py --dataset data/2015.csv --models-dir models
 ```
 
-Opções úteis:
+Argumentos:
 
-- `--sample N` — avalia em uma amostra de N linhas
-- `--only binge|smoke|both` — escolhe qual(is) modelo(s) avaliar (padrão: `both`)
+- `--sample N` — avalia em uma amostra de N linhas.
+- `--models-dir DIR` — diretório contendo o `.joblib` treinado.
 
-Saída esperada: métricas por alvo (Accuracy, ROC-AUC, matriz de confusão, Precisão, Recall, Especificidade, F1).
+O script imprime métricas (Accuracy, ROC-AUC, Precisão, Recall, Especificidade e F1) e a matriz de confusão.
 
 ## Estrutura
 
-- `train_brfss_2015.py` — script principal de treinamento (gera os `.joblib`)
-- `scripts/evaluate_models.py` — avaliação dos modelos salvos
-- `data/2015.csv` — dataset de entrada (não versionado)
-- `models/` — artefatos dos modelos (saída)
-- `requirements.txt` — dependências do projeto
+- `train_brfss_2015.py` — script de treinamento e persistência do modelo.
+- `scripts/evaluate_models.py` — avaliação do modelo salvo.
+- `model_metrics.py` — utilitários compartilhados para métricas.
+- `data/2015.csv` — dataset de entrada (não versionado).
+- `models/` — artefatos produzidos pelo treinamento.
+- `requirements.txt` — dependências do projeto.
 
 ## Observações
 
-- O pré-processamento no pipeline salvo inclui imputação, clipping IQR, padronização para numéricos e one‑hot para categóricos.
-- A limpeza inclui regras por coluna e uma heurística segura de códigos de não resposta.
-- O script lida com diferenças de versão do scikit‑learn para `OneHotEncoder`.
+- O pré-processamento inclui imputação, winsorização via IQR, padronização e one-hot encoding.
+- Regras específicas por coluna removem códigos de não resposta antes do balanceamento.
+- As importâncias de variáveis (permutation importance) ajudam a identificar quais fatores mais contribuem para o tabagismo atual.

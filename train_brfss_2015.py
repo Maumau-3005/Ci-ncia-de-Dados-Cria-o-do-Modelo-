@@ -4,9 +4,9 @@
 """
 Script: train_brfss_2015.py
 
-Objetivo: Treinar modelos para dois alvos no BRFSS 2015 (binge drinking e fumante atual)
-com pipeline de pré-processamento e salvar os artefatos. O script imprime mensagens
-didáticas no formato "PASSO X: ..." ao longo do processo.
+Objetivo: Treinar modelos para o alvo `_SMOKER3` (fumante atual) no BRFSS 2015
+com pipeline de pré-processamento e salvar o artefato resultante. O script imprime
+mensagens didáticas no formato "PASSO X: ..." ao longo do processo.
 
 Observação importante: códigos de não resposta variam por coluna. Este
 script aplica regras específicas por coluna (limpeza manual) e uma heurística
@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import argparse
 import warnings
-from typing import Dict, Set, Tuple, Any, List
+from typing import Dict, Set, Tuple, Any, List, Iterable
 
 import numpy as np
 import pandas as pd
@@ -34,6 +34,7 @@ from sklearn import linear_model
 from sklearn import ensemble
 from sklearn.pipeline import Pipeline
 from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.inspection import permutation_importance
 
 from model_metrics import classification_metrics, proba_or_score
 # ==========================
@@ -76,14 +77,12 @@ SELECTED_FEATURES = [
     "MENTHLTH",
     "PHYSHLTH",
     "EXERANY2",
-    "_RFDRHV5",
     "SEX",
     "CHILDREN",
     "HLTHPLN1",
     "_TOTINDA",
     "DIABETE3",
     "ASTHMA3",
-    "_SMOKER3",
 ]
 
 # Subconjunto tratado como numérico contínuo dentro das features selecionadas
@@ -282,47 +281,27 @@ def create_balanced_sample(
     )
 
 
-def derive_targets(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, List[str]]:
+def derive_smoker_target(df: pd.DataFrame) -> pd.Series:
     """
-    Constrói os dois alvos a partir das colunas já presentes no dataset reduzido.
-
-    - Binge (binário) usa `_RFDRHV5`, onde 2 representa consumo excessivo e 1,
-      não consumo. O valor é transformado para 1.0 (binge) / 0.0 (não binge) e
-      outros códigos viram NaN.
-    - Fumante atual (binário) usa `_SMOKER3`: códigos 1/2 => 1.0 (fumantes),
-      códigos 3/4 => 0.0 (não fumantes); demais => NaN.
-
-    Retorna (y_binge, y_smoke, leakage_cols) – leakage_cols devem ser removidas
-    das features para evitar vazamentos.
+    Constrói o alvo binário de fumante atual (1 = fumante, 0 = não fumante)
+    com base na coluna `_SMOKER3`. Outros códigos são convertidos para NaN.
     """
-    for required in ["_RFDRHV5", "_SMOKER3"]:
-        if required not in df.columns:
-            raise ValueError(
-                f"Não foi possível construir os alvos: coluna obrigatória {required} ausente."
-            )
-
-    leakage_cols: List[str] = []
-
-    s_binge = pd.to_numeric(df["_RFDRHV5"], errors="coerce")
-    if not s_binge.dropna().isin({0.0, 1.0}).all():
-        s_binge = pd.Series(
-            np.where(s_binge == 2, 1.0, np.where(s_binge == 1, 0.0, np.nan)),
-            index=s_binge.index,
+    if "_SMOKER3" not in df.columns:
+        raise ValueError(
+            "Não foi possível construir o alvo: coluna obrigatória `_SMOKER3` ausente."
         )
-    y_binge = s_binge.astype(float)
-    leakage_cols.append("_RFDRHV5")
 
     s_smoke = pd.to_numeric(df["_SMOKER3"], errors="coerce")
     y_smoke = pd.Series(
         np.where(s_smoke.isin([1, 2]), 1.0, np.where(s_smoke.isin([3, 4]), 0.0, np.nan)),
         index=s_smoke.index,
     )
-    leakage_cols.append("_SMOKER3")
-
-    return y_binge, y_smoke, leakage_cols
+    return y_smoke.astype(float)
 
 
-def select_features(df: pd.DataFrame, leakage_cols: List[str]) -> Tuple[List[str], List[str]]:
+def select_features(
+    df: pd.DataFrame, leakage_cols: Iterable[str] | None = None
+) -> Tuple[List[str], List[str]]:
     """Seleciona as colunas definidas manualmente e separa tipos para o pipeline."""
 
     available = [c for c in SELECTED_FEATURES if c in df.columns]
@@ -337,7 +316,7 @@ def select_features(df: pd.DataFrame, leakage_cols: List[str]) -> Tuple[List[str
     features = available.copy()
 
     # Remover potenciais vazamentos (colunas usadas na derivação do alvo corrente)
-    for leak in leakage_cols:
+    for leak in leakage_cols or ():
         if leak in features:
             features.remove(leak)
 
@@ -352,6 +331,31 @@ def select_features(df: pd.DataFrame, leakage_cols: List[str]) -> Tuple[List[str
             cat_cols.append(c)
 
     return cat_cols, num_cols
+
+
+def prepare_smoker_dataset(
+    df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.Series, List[str], List[str]]:
+    """
+    Prepara o conjunto de dados para treinamento/avaliação do alvo fumante.
+
+    - Seleciona features válidas
+    - Constrói o alvo `_SMOKER3` (binário)
+    - Remove linhas com qualquer NaN em features ou target
+    """
+    y_smoke = derive_smoker_target(df)
+    cat_cols, num_cols = select_features(df, leakage_cols=["_SMOKER3"])
+    feature_cols = cat_cols + num_cols
+
+    if not feature_cols:
+        raise RuntimeError("Nenhuma feature disponível após filtragem.")
+
+    X = df.loc[:, feature_cols].copy()
+    dataset = X.join(y_smoke.rename("target"))
+    dataset = dataset.dropna()
+
+    y_clean = dataset.pop("target").astype(int)
+    return dataset, y_clean, cat_cols, num_cols
 
 
 def build_preprocess(cat_cols: List[str], num_cols: List[str]) -> compose.ColumnTransformer:
@@ -540,6 +544,32 @@ def fit_and_evaluate(
     results[best_name]["specificity"] = metric_summary["specificity"]
     results[best_name]["f1"] = metric_summary["f1"]
 
+    feature_cols = cat_cols + num_cols
+    feature_summary: List[Tuple[str, float]] | None = None
+    if eval_X is not None and len(eval_X) > 0:
+        try:
+            pi_result = permutation_importance(
+                final_pipe,
+                eval_X,
+                eval_y,
+                n_repeats=10,
+                random_state=RANDOM_STATE,
+                n_jobs=-1,
+            )
+            importances = pi_result.importances_mean
+            feature_summary = sorted(
+                [
+                    (feature_cols[idx], float(importances[idx]))
+                    for idx in range(len(feature_cols))
+                ],
+                key=lambda item: abs(item[1]),
+                reverse=True,
+            )
+        except Exception:
+            feature_summary = None
+
+    results[best_name]["feature_importances"] = feature_summary or []
+
     print(
         f"Modelo selecionado (validação)={best_name} | Alvo={target_name.upper()} | "
         f"Val Accuracy={best_val_acc*100:.2f}% | {eval_desc.title()} Accuracy={final_test_acc*100:.2f}% | "
@@ -551,47 +581,34 @@ def fit_and_evaluate(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dataset",
+        default=os.path.join("data", "2015.csv"),
+        help="Caminho para o CSV do BRFSS 2015.",
+    )
     parser.add_argument("--quick", action="store_true", help="Executa com modelos mais leves.")
     parser.add_argument("--sample", type=int, default=None, help="Amostragem de N linhas do dataset.")
     parser.add_argument(
-        "--balanced-binge",
-        action="store_true",
-        help="Cria amostra balanceada (50/50) para o alvo Binge antes do treinamento.",
-    )
-    parser.add_argument(
-        "--balanced-binge-size",
+        "--balance-per-class",
         type=int,
         default=25000,
-        help="Quantidade de amostras por classe (positiva/negativa) para balancear Binge.",
+        help="Quantidade máxima de registros por classe após balanceamento 50/50.",
     )
     parser.add_argument(
-        "--balanced-binge-train",
-        type=int,
-        default=40000,
-        help="Tamanho desejado do conjunto de treino (treino+validação) após balanceamento de Binge.",
-    )
-    parser.add_argument(
-        "--balanced-binge-val-frac",
-        type=float,
-        default=0.2,
-        help="Fração do conjunto de treino (após balancear Binge) destinada à validação.",
-    )
-    parser.add_argument(
-        "--balanced-binge-holdout",
+        "--balance-holdout",
         type=float,
         default=0.1,
-        help="Proporção mínima por classe reservada para o teste externo de Binge (0-0.5).",
+        help="Proporção mínima por classe reservada para avaliação externa (0-0.5).",
     )
     args = parser.parse_args()
-    # Carregar dados
+
     log("Carregando dataset BRFSS 2015…")
-    csv_path = os.path.join("data", "2015.csv")
-    required_cols = sorted(set(SELECTED_FEATURES + ["_RFDRHV5", "_SMOKER3"]))
-    df = read_dataset(csv_path)
+    df = read_dataset(args.dataset)
     if args.sample is not None and args.sample > 0 and args.sample < len(df):
         log(f"Amostrando {args.sample} linhas do dataset para execução rápida…")
         df = df.sample(n=args.sample, random_state=RANDOM_STATE)
 
+    required_cols = sorted(set(SELECTED_FEATURES + ["_SMOKER3"]))
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
         raise ValueError(
@@ -611,172 +628,111 @@ def main() -> None:
     df = apply_missing_map(df, missing_map)
     log("Ausentes tratados respeitando a especificidade por coluna (heurística).")
 
-    # Construção dos alvos
-    log("Construindo os alvos (Binge e Fumante atual)…")
-    y_binge, y_smoke, leakage_cols = derive_targets(df)
+    log("Preparando dataset limpo para o alvo fumante atual…")
+    X_full, y_full, cat_cols, num_cols = prepare_smoker_dataset(df)
+    total = len(y_full)
+    positives = int((y_full == 1).sum())
+    negatives = int((y_full == 0).sum())
+    log(
+        f"Após limpeza, restaram {total} registros válidos "
+        f"({positives} fumantes, {negatives} não fumantes)."
+    )
 
-    # Seleção de features
-    log("Selecionando features disponíveis e separando tipos…")
-    cat_cols, num_cols = select_features(df, leakage_cols)
-    if not cat_cols and not num_cols:
-        raise RuntimeError("Nenhuma feature disponível após filtragem.")
+    log("Balanceando o dataset (50/50) via subamostragem estratificada…")
+    X_bal, y_bal, actual_per_class, selected_idx = create_balanced_sample(
+        X_full,
+        y_full,
+        positive_label=1.0,
+        negative_label=0.0,
+        per_class=args.balance_per_class,
+        random_state=RANDOM_STATE,
+        holdout_ratio=args.balance_holdout,
+    )
+    log(
+        f"Amostra balanceada contém {len(X_bal)} registros ({actual_per_class} por classe)."
+    )
 
-    # Pré-processamento
+    selected_idx = pd.Index(selected_idx)
+    remaining_idx = y_full.index.difference(selected_idx)
+    external_X: pd.DataFrame | None = None
+    external_y: pd.Series | None = None
+    if args.balance_holdout > 0 and not remaining_idx.empty:
+        external_X = X_full.loc[remaining_idx].copy()
+        external_y = y_full.loc[remaining_idx].copy()
+        log(
+            f"Teste externo utilizará {len(external_X)} registros remanescentes sem sobreposição com a amostra balanceada."
+        )
+    else:
+        log("Sem amostra remanescente suficiente para teste externo; usando apenas teste interno estratificado.")
+
     log(
         "Montando pipeline de pré-processamento (imputação + clipping IQR + one-hot + padronização)…"
     )
     preprocess = build_preprocess(cat_cols, num_cols)
 
-    # Preparar modelos
     models = get_models("quick" if args.quick else "full")
 
-    # Treinamento e avaliação por alvo
-    binge_df = df
-    binge_y = y_binge
-    binge_test_size: float | int = 0.15
-    binge_val_fraction = 15 / 85
-
-    if args.balanced_binge:
-        per_class = args.balanced_binge_size
-        total_requested = per_class * 2
-        log(
-            "Gerando amostra balanceada para Binge (" \
-            f"{per_class} positivos e {per_class} negativos; total={total_requested})…"
-        )
-        binge_df, binge_y, actual_per_class, binge_selected_idx = create_balanced_sample(
-            df,
-            y_binge,
-            positive_label=1.0,
-            negative_label=0.0,
-            per_class=per_class,
-            random_state=RANDOM_STATE,
-            holdout_ratio=args.balanced_binge_holdout,
-        )
-
-        total_selected = actual_per_class * 2
-        if actual_per_class < per_class:
-            log(
-                f"Aviso: somente {actual_per_class} amostras por classe disponíveis para Binge; "
-                f"utilizando total={total_selected}."
-            )
-
-        internal_test_min_frac = 0.1
-        min_test_required = max(2, int(total_selected * internal_test_min_frac))
-        if total_selected <= min_test_required:
-            raise ValueError(
-                "Amostra balanceada para Binge é muito pequena para separar treino e teste internos."
-            )
-        train_target = min(args.balanced_binge_train, total_selected - min_test_required)
-        if train_target <= 0:
-            raise ValueError(
-                "balanced-binge-train deve ser positivo e menor que o total selecionado."
-            )
-        binge_test_size = len(binge_df) - train_target
-        if binge_test_size <= 0:
-            raise ValueError(
-                "Configuração de balanceamento deixou o conjunto de teste vazio."
-            )
-        binge_val_fraction = args.balanced_binge_val_frac
-        log(
-            f"Amostra balanceada criada: total={len(binge_df)}, treino+val={train_target}, "
-            f"teste={binge_test_size}. Validação dentro do treino: {binge_val_fraction*100:.2f}%"
-        )
-
-    binge_external_X: pd.DataFrame | None = None
-    binge_external_y: pd.Series | None = None
-
-    if args.balanced_binge:
-        valid_idx = df.loc[y_binge.notna()].index
-        selected_idx = pd.Index(binge_selected_idx)
-        remaining_idx = valid_idx.difference(selected_idx)
-        if remaining_idx.empty:
-            raise ValueError(
-                "Após separar o conjunto balanceado de treino, não restaram dados para teste externo."
-            )
-        binge_external_X = df.loc[remaining_idx, cat_cols + num_cols].copy()
-        binge_external_y = y_binge.loc[remaining_idx].astype(int)
-        log(
-            f"Teste externo de Binge utilizará {len(binge_external_X)} registros (complemento do balanceado)."
-        )
-
-    else:
-        # Sem balanceamento: use apenas o teste interno estratificado.
-        # Definir um teste externo aqui incluiria dados de treino na avaliação final.
-        binge_external_X = None
-        binge_external_y = None
-
-    log("Treinando e avaliando modelos para Binge…")
-    binge_results, (binge_best_name, binge_best_acc, binge_best_pipe) = fit_and_evaluate(
-        binge_df,
-        binge_y,
+    log("Treinando e avaliando modelos para o alvo Fumante atual…")
+    smoke_results, (best_name, best_acc, best_pipe) = fit_and_evaluate(
+        X_bal,
+        y_bal,
         preprocess,
         cat_cols,
         num_cols,
-        target_name="Binge",
+        target_name="Fumante atual",
         models=models,
-        test_size=binge_test_size,
-        val_fraction_within_train=binge_val_fraction,
-        external_X_test=binge_external_X,
-        external_y_test=binge_external_y,
+        external_X_test=external_X,
+        external_y_test=external_y,
     )
 
-    log("Treinando e avaliando modelos para Fumante atual…")
-    smoke_results, (smoke_best_name, smoke_best_acc, smoke_best_pipe) = fit_and_evaluate(
-        df, y_smoke, preprocess, cat_cols, num_cols, target_name="Fumante atual", models=models
-    )
+    log("Treinamento concluído.")
 
-    log("Treinamento e avaliação concluídos para todos os modelos.")
-
-    # Salvar artefatos
-    log("Salvando pipelines treinados em models/…")
+    log("Salvando pipeline treinado em models/smoker_current_model.joblib…")
     os.makedirs("models", exist_ok=True)
-    dump(binge_best_pipe, os.path.join("models", "alcohol_binge_model.joblib"))
-    dump(smoke_best_pipe, os.path.join("models", "smoker_current_model.joblib"))
+    dump(best_pipe, os.path.join("models", "smoker_current_model.joblib"))
 
-    # Relatório final amigável
     print("\n========== RESULTADOS ==========")
 
-    def _print_target_block(
-        label: str,
-        results: Dict[str, Dict[str, float]],
-        best_name: str,
-        best_acc: float,
-    ) -> None:
-        print(f"\n>> {label.upper()}")
-        print("  Modelos avaliados:")
-        for name in sorted(results.keys()):
-            metrics_map = results[name]
-            val_txt = _fmt_pct(metrics_map.get("val_acc"))
-            test_txt = _fmt_pct(metrics_map.get("test_acc"))
-            auc_txt = _fmt_pct(metrics_map.get("test_auc"))
-            print(f"    - {name:<30} | Val={val_txt:<8} Test={test_txt:<8} ROC-AUC={auc_txt:<8}")
+    print("\n>> FUMANTE ATUAL")
+    print("  Modelos avaliados:")
+    for name in sorted(smoke_results.keys()):
+        metrics_map = smoke_results[name]
+        val_txt = _fmt_pct(metrics_map.get("val_acc"))
+        test_txt = _fmt_pct(metrics_map.get("test_acc"))
+        auc_txt = _fmt_pct(metrics_map.get("test_auc"))
+        print(f"    - {name:<30} | Val={val_txt:<8} Test={test_txt:<8} ROC-AUC={auc_txt:<8}")
 
-        best_metrics = results[best_name]
-        print(f"\n  Melhor modelo: {best_name}")
-        print(
-            "    → Val={val} | Test={test} | ROC-AUC={auc}"
-            .format(
-                val=_fmt_pct(best_metrics.get("val_acc")),
-                test=_fmt_pct(best_metrics.get("test_acc")),
-                auc=_fmt_pct(best_metrics.get("test_auc")),
-            )
+    best_metrics = smoke_results[best_name]
+    print(f"\n  Melhor modelo: {best_name}")
+    print(
+        "    → Val={val} | Test={test} | ROC-AUC={auc}"
+        .format(
+            val=_fmt_pct(best_metrics.get("val_acc")),
+            test=_fmt_pct(best_metrics.get("test_acc")),
+            auc=_fmt_pct(best_metrics.get("test_auc")),
         )
+    )
 
-        _print_confusion_matrix(best_metrics.get("confusion_matrix", []))
+    _print_confusion_matrix(best_metrics.get("confusion_matrix", []))
 
-        print(
-            "    Métricas complementares: Precisão={p:.3f} | Recall={r:.3f} | "
-            "Especificidade={s:.3f} | F1={f:.3f}"
-            .format(
-                p=best_metrics.get("precision", float("nan")),
-                r=best_metrics.get("recall", float("nan")),
-                s=best_metrics.get("specificity", float("nan")),
-                f=best_metrics.get("f1", float("nan")),
-            )
+    print(
+        "    Métricas complementares: Precisão={p:.3f} | Recall={r:.3f} | "
+        "Especificidade={s:.3f} | F1={f:.3f}"
+        .format(
+            p=best_metrics.get("precision", float("nan")),
+            r=best_metrics.get("recall", float("nan")),
+            s=best_metrics.get("specificity", float("nan")),
+            f=best_metrics.get("f1", float("nan")),
         )
+    )
 
-    _print_target_block("Binge", binge_results, binge_best_name, binge_best_acc)
-    _print_target_block("Fumante atual", smoke_results, smoke_best_name, smoke_best_acc)
+    feature_summary = best_metrics.get("feature_importances")
+    if feature_summary:
+        print("\n  Principais variáveis associadas ao tabagismo (permutation importance):")
+        for rank, (feat, importance) in enumerate(feature_summary[:10], start=1):
+            print(f"    {rank:>2}. {feat:<30} Δ={importance:.5f}")
+    else:
+        print("\n  Não foi possível calcular importâncias de features.")
 
 
 

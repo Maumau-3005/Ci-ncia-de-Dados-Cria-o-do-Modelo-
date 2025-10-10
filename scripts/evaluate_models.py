@@ -2,15 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-Avalia os modelos salvos (binge e fumante atual) de forma conjunta
-usando o dataset BRFSS 2015. Reaproveita as mesmas rotinas de limpeza
-e derivação de alvos do script de treinamento.
+Avalia o modelo salvo para fumante atual (`_SMOKER3`) usando o dataset
+BRFSS 2015. Reaproveita as mesmas rotinas de limpeza e derivação do
+script de treinamento.
 
 Uso básico:
   python scripts/evaluate_models.py \
     --dataset data/2015.csv \
     --models-dir models \
-    [--sample 50000] [--only binge|smoke|both]
+    [--sample 50000]
 """
 
 from __future__ import annotations
@@ -39,8 +39,7 @@ from train_brfss_2015 import (
     apply_manual_cleaning,
     build_missing_map,
     apply_missing_map,
-    derive_targets,
-    select_features,
+    prepare_smoker_dataset,
     IQRClipper,
 )
 
@@ -84,7 +83,6 @@ def main() -> None:
     parser.add_argument("--dataset", default=os.path.join("data", "2015.csv"))
     parser.add_argument("--models-dir", default="models")
     parser.add_argument("--sample", type=int, default=None)
-    parser.add_argument("--only", choices=["binge", "smoke", "both"], default="both")
     args = parser.parse_args()
 
     # Carregar dataset
@@ -92,7 +90,7 @@ def main() -> None:
     if args.sample is not None and 0 < args.sample < len(df):
         df = df.sample(n=args.sample, random_state=42)
 
-    required_cols = sorted(set(SELECTED_FEATURES + ["_RFDRHV5", "_SMOKER3"]))
+    required_cols = sorted(set(SELECTED_FEATURES + ["_SMOKER3"]))
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise ValueError("Dataset não contém colunas necessárias: " + ", ".join(missing))
@@ -104,51 +102,38 @@ def main() -> None:
     missing_map = build_missing_map(df)
     df = apply_missing_map(df, missing_map)
 
-    # Alvos e features
-    y_binge, y_smoke, leakage_cols = derive_targets(df)
-    cat_cols, num_cols = select_features(df, leakage_cols)
-    feat_cols = cat_cols + num_cols
-    if not feat_cols:
-        raise RuntimeError("Nenhuma feature disponível após filtragem.")
+    # Features e alvo focados em tabagismo
+    X, y, _, _ = prepare_smoker_dataset(df)
+    if len(X) == 0:
+        raise ValueError("Nenhum registro válido restante após limpeza e remoção de NaNs.")
 
-    X = df.loc[:, feat_cols].copy()
+    positives = int((y == 1).sum())
+    negatives = int((y == 0).sum())
+    print(
+        f"Registros avaliados após limpeza: {len(X)} "
+        f"(fumantes={positives}, não fumantes={negatives})."
+    )
 
-    # Caminhos dos modelos
-    binge_path = os.path.join(args.models_dir, "alcohol_binge_model.joblib")
     smoke_path = os.path.join(args.models_dir, "smoker_current_model.joblib")
-
-    def print_block(title: str, res: Dict[str, Any]) -> None:
-        print(f"\n== {title} ==")
-        print(f"Amostras avaliadas: {res['n']}")
-        print(
-            f"Accuracy={as_pct(res['accuracy'])} | ROC-AUC={as_pct(res['roc_auc'])} | "
-            f"Precisão={res['precision']:.3f} | Recall={res['recall']:.3f} | "
-            f"Especificidade={res['specificity']:.3f} | F1={res['f1']:.3f}"
+    if not os.path.exists(smoke_path):
+        raise FileNotFoundError(
+            f"Modelo não encontrado: {smoke_path}. Treine antes de avaliar."
         )
-        print("Matriz de confusão [real 0/1 x prev 0/1]:")
-        cm = res["confusion_matrix"]
-        print(f"  [TN={cm[0][0]:>6}  FP={cm[0][1]:>6}]")
-        print(f"  [FN={cm[1][0]:>6}  TP={cm[1][1]:>6}]")
 
-    # Binge
-    if args.only in ("binge", "both"):
-        if not os.path.exists(binge_path):
-            raise FileNotFoundError(
-                f"Modelo não encontrado: {binge_path}. Treine antes de avaliar."
-            )
-        binge_pipe = load(binge_path)
-        binge_res = evaluate(binge_pipe, X, y_binge)
-        print_block("BINGE", binge_res)
+    smoke_pipe = load(smoke_path)
+    smoke_res = evaluate(smoke_pipe, X, y)
 
-    # Fumante atual
-    if args.only in ("smoke", "both"):
-        if not os.path.exists(smoke_path):
-            raise FileNotFoundError(
-                f"Modelo não encontrado: {smoke_path}. Treine antes de avaliar."
-            )
-        smoke_pipe = load(smoke_path)
-        smoke_res = evaluate(smoke_pipe, X, y_smoke)
-        print_block("FUMANTE ATUAL", smoke_res)
+    print("\n== FUMANTE ATUAL ==")
+    print(f"Amostras avaliadas: {smoke_res['n']}")
+    print(
+        f"Accuracy={as_pct(smoke_res['accuracy'])} | ROC-AUC={as_pct(smoke_res['roc_auc'])} | "
+        f"Precisão={smoke_res['precision']:.3f} | Recall={smoke_res['recall']:.3f} | "
+        f"Especificidade={smoke_res['specificity']:.3f} | F1={smoke_res['f1']:.3f}"
+    )
+    print("Matriz de confusão [real 0/1 x prev 0/1]:")
+    cm = smoke_res["confusion_matrix"]
+    print(f"  [TN={cm[0][0]:>6}  FP={cm[0][1]:>6}]")
+    print(f"  [FN={cm[1][0]:>6}  TP={cm[1][1]:>6}]")
 
 
 if __name__ == "__main__":
