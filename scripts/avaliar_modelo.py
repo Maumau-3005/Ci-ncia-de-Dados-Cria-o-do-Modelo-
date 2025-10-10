@@ -7,7 +7,7 @@ BRFSS 2015. Reaproveita as mesmas rotinas de limpeza e derivação do
 script de treinamento.
 
 Uso básico:
-  python scripts/evaluate_models.py \
+  python scripts/avaliar_modelo.py \
     --dataset data/2015.csv \
     --models-dir models \
     [--sample 50000]
@@ -25,7 +25,7 @@ from joblib import load
 import sys
 from pathlib import Path
 
-from model_metrics import classification_metrics, proba_or_score
+from metricas_modelo import metricas_classificacao, probabilidades_ou_scores
 
 # Garante que o diretório raiz (pai de scripts/) esteja no sys.path
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,24 +33,27 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 # Importa utilitários do script de treino (no diretório raiz)
-from train_brfss_2015 import (
-    SELECTED_FEATURES,
-    read_dataset,
-    apply_manual_cleaning,
-    build_missing_map,
-    apply_missing_map,
-    prepare_smoker_dataset,
-    IQRClipper,
+from treinar_tabagismo_brfss_2015 import (
+    COLUNAS_SELECIONADAS,
+    carregar_dataset,
+    aplicar_limpeza_manual,
+    construir_mapa_ausentes,
+    aplicar_mapa_ausentes,
+    preparar_dados_fumante,
+    LimitadorIQR,
 )
 
 # Compatibilidade com artefatos treinados quando o script de treino foi executado como __main__
-# e a classe IQRClipper foi serializada com esse qualname.
+# e a classe LimitadorIQR foi serializada com esse qualname.
 _main_mod = sys.modules.get("__main__")
-if _main_mod is not None and not hasattr(_main_mod, "IQRClipper"):
-    setattr(_main_mod, "IQRClipper", IQRClipper)
+if _main_mod is not None:
+    if not hasattr(_main_mod, "LimitadorIQR"):
+        setattr(_main_mod, "LimitadorIQR", LimitadorIQR)
+    if not hasattr(_main_mod, "IQRClipper"):
+        setattr(_main_mod, "IQRClipper", LimitadorIQR)
 
 
-def evaluate(pipe, X: pd.DataFrame, y_true: pd.Series) -> Dict[str, Any]:
+def avaliar_modelo(modelo, X: pd.DataFrame, y_true: pd.Series) -> Dict[str, Any]:
     mask = y_true.notna()
     X_eval = X.loc[mask]
     y_eval = y_true.loc[mask].astype(int)
@@ -58,21 +61,21 @@ def evaluate(pipe, X: pd.DataFrame, y_true: pd.Series) -> Dict[str, Any]:
     if len(X_eval) == 0:
         raise ValueError("Sem exemplos válidos para avaliação (y ausente).")
 
-    y_pred = pipe.predict(X_eval)
+    y_pred = modelo.predict(X_eval)
 
     try:
-        scores = proba_or_score(pipe, X_eval)
+        scores = probabilidades_ou_scores(modelo, X_eval)
     except Exception:
         scores = None
 
-    metrics_summary = classification_metrics(
+    metrics_summary = metricas_classificacao(
         y_eval, y_pred, scores=scores, positive_label=1
     )
     metrics_summary["n"] = int(len(X_eval))
     return metrics_summary
 
 
-def as_pct(x: float | None) -> str:
+def formata_pct(x: float | None) -> str:
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return "--"
     return f"{x*100:.2f}%"
@@ -86,52 +89,52 @@ def main() -> None:
     args = parser.parse_args()
 
     # Carregar dataset
-    df = read_dataset(args.dataset)
+    df = carregar_dataset(args.dataset)
     if args.sample is not None and 0 < args.sample < len(df):
         df = df.sample(n=args.sample, random_state=42)
 
-    required_cols = sorted(set(SELECTED_FEATURES + ["_SMOKER3"]))
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        raise ValueError("Dataset não contém colunas necessárias: " + ", ".join(missing))
+    colunas_necessarias = sorted(set(COLUNAS_SELECIONADAS + ["_SMOKER3"]))
+    ausentes = [c for c in colunas_necessarias if c not in df.columns]
+    if ausentes:
+        raise ValueError("Dataset não contém colunas necessárias: " + ", ".join(ausentes))
 
-    df = df.loc[:, required_cols]
+    df = df.loc[:, colunas_necessarias]
 
     # Limpeza equivalente ao treino
-    df = apply_manual_cleaning(df)
-    missing_map = build_missing_map(df)
-    df = apply_missing_map(df, missing_map)
+    df = aplicar_limpeza_manual(df)
+    mapa_ausentes = construir_mapa_ausentes(df)
+    df = aplicar_mapa_ausentes(df, mapa_ausentes)
 
     # Features e alvo focados em tabagismo
-    X, y, _, _ = prepare_smoker_dataset(df)
+    X, y, _, _ = preparar_dados_fumante(df)
     if len(X) == 0:
         raise ValueError("Nenhum registro válido restante após limpeza e remoção de NaNs.")
 
-    positives = int((y == 1).sum())
-    negatives = int((y == 0).sum())
+    total_fumantes = int((y == 1).sum())
+    total_nao_fumantes = int((y == 0).sum())
     print(
         f"Registros avaliados após limpeza: {len(X)} "
-        f"(fumantes={positives}, não fumantes={negatives})."
+        f"(fumantes={total_fumantes}, não fumantes={total_nao_fumantes})."
     )
 
-    smoke_path = os.path.join(args.models_dir, "smoker_current_model.joblib")
-    if not os.path.exists(smoke_path):
+    caminho_modelo = os.path.join(args.models_dir, "smoker_current_model.joblib")
+    if not os.path.exists(caminho_modelo):
         raise FileNotFoundError(
-            f"Modelo não encontrado: {smoke_path}. Treine antes de avaliar."
+            f"Modelo não encontrado: {caminho_modelo}. Treine antes de avaliar."
         )
 
-    smoke_pipe = load(smoke_path)
-    smoke_res = evaluate(smoke_pipe, X, y)
+    modelo_salvo = load(caminho_modelo)
+    resultado = avaliar_modelo(modelo_salvo, X, y)
 
     print("\n== FUMANTE ATUAL ==")
-    print(f"Amostras avaliadas: {smoke_res['n']}")
+    print(f"Amostras avaliadas: {resultado['n']}")
     print(
-        f"Accuracy={as_pct(smoke_res['accuracy'])} | ROC-AUC={as_pct(smoke_res['roc_auc'])} | "
-        f"Precisão={smoke_res['precision']:.3f} | Recall={smoke_res['recall']:.3f} | "
-        f"Especificidade={smoke_res['specificity']:.3f} | F1={smoke_res['f1']:.3f}"
+        f"Accuracy={formata_pct(resultado['accuracy'])} | ROC-AUC={formata_pct(resultado['roc_auc'])} | "
+        f"Precisão={resultado['precision']:.3f} | Recall={resultado['recall']:.3f} | "
+        f"Especificidade={resultado['specificity']:.3f} | F1={resultado['f1']:.3f}"
     )
     print("Matriz de confusão [real 0/1 x prev 0/1]:")
-    cm = smoke_res["confusion_matrix"]
+    cm = resultado["confusion_matrix"]
     print(f"  [TN={cm[0][0]:>6}  FP={cm[0][1]:>6}]")
     print(f"  [FN={cm[1][0]:>6}  TP={cm[1][1]:>6}]")
 

@@ -20,7 +20,7 @@ pip install -r requirements.txt
 
 Coloque o arquivo BRFSS 2015 em `data/2015.csv`.
 
-As colunas necessárias são o conjunto definido em `SELECTED_FEATURES` e a coluna
+As colunas necessárias são o conjunto definido em `COLUNAS_SELECIONADAS` e a coluna
 de alvo `_SMOKER3`. O script valida a presença dessas colunas antes de iniciar o
 treinamento.
 
@@ -29,7 +29,7 @@ treinamento.
 Executa o pipeline completo:
 
 ```
-python train_brfss_2015.py
+python treinar_tabagismo_brfss_2015.py
 ```
 
 Opções úteis:
@@ -56,7 +56,7 @@ O artefato treinado é salvo em:
 A avaliação reutiliza as mesmas etapas de limpeza e preparação para medir o desempenho do modelo salvo:
 
 ```
-python scripts/evaluate_models.py --dataset data/2015.csv --models-dir models
+python scripts/avaliar_modelo.py --dataset data/2015.csv --models-dir models
 ```
 
 Argumentos:
@@ -68,9 +68,9 @@ O script imprime métricas (Accuracy, ROC-AUC, Precisão, Recall, Especificidade
 
 ## Estrutura
 
-- `train_brfss_2015.py` — script de treinamento e persistência do modelo.
-- `scripts/evaluate_models.py` — avaliação do modelo salvo.
-- `model_metrics.py` — utilitários compartilhados para métricas.
+- `treinar_tabagismo_brfss_2015.py` — script de treinamento e persistência do modelo.
+- `scripts/avaliar_modelo.py` — avaliação do modelo salvo.
+- `metricas_modelo.py` — utilitários compartilhados para métricas.
 - `data/2015.csv` — dataset de entrada (não versionado).
 - `models/` — artefatos produzidos pelo treinamento.
 - `requirements.txt` — dependências do projeto.

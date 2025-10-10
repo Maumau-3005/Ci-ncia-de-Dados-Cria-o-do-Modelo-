@@ -16,7 +16,7 @@ import numpy as np
 from sklearn import metrics
 
 
-def proba_or_score(estimator, X) -> np.ndarray:
+def probabilidades_ou_scores(estimator, X) -> np.ndarray:
     """
     Retorna probabilidades da classe positiva quando disponíveis.
     Caso contrário, devolve scores normalizados ou previsões (0/1).
@@ -39,11 +39,11 @@ def proba_or_score(estimator, X) -> np.ndarray:
     return np.asarray(preds, dtype=float)
 
 
-def _safe_div(numerator: float, denominator: float) -> float:
+def _divisao_segura(numerator: float, denominator: float) -> float:
     return float(numerator / denominator) if denominator else float("nan")
 
 
-def classification_metrics(
+def metricas_classificacao(
     y_true: Iterable[Any],
     y_pred: Iterable[Any],
     *,
@@ -79,10 +79,10 @@ def classification_metrics(
         tn = fp = fn = tp = 0
         cm = np.array([[0, 0], [0, 0]])
 
-    precision = _safe_div(tp, tp + fp)
-    recall = _safe_div(tp, tp + fn)
-    specificity = _safe_div(tn, tn + fp)
-    f1 = _safe_div(2 * tp, 2 * tp + fp + fn)
+    precision = _divisao_segura(tp, tp + fp)
+    recall = _divisao_segura(tp, tp + fn)
+    specificity = _divisao_segura(tn, tn + fp)
+    f1 = _divisao_segura(2 * tp, 2 * tp + fp + fn)
 
     return {
         "accuracy": float(accuracy),
@@ -96,4 +96,3 @@ def classification_metrics(
         "specificity": float(specificity),
         "f1": float(f1),
     }
-

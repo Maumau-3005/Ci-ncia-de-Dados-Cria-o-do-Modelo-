@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Script: train_brfss_2015.py
+Script: treinar_tabagismo_brfss_2015.py
 
 Objetivo: Treinar modelos para o alvo `_SMOKER3` (fumante atual) no BRFSS 2015
 com pipeline de pré-processamento e salvar o artefato resultante. O script imprime
@@ -35,7 +35,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.inspection import permutation_importance
 
-from model_metrics import classification_metrics, proba_or_score
+from metricas_modelo import metricas_classificacao, probabilidades_ou_scores
 # ==========================
 # Utilitário de logging
 # ==========================
@@ -49,7 +49,7 @@ def log(msg: str) -> None:
 
 
 warnings.simplefilter("ignore")
-RANDOM_STATE = 42
+SEMENTE_ALEATORIA = 42
 
 
 def _fmt_pct(value: float | None) -> str:
@@ -67,7 +67,7 @@ def _print_confusion_matrix(matrix: List[List[int]]) -> None:
 
 
 # Lista de colunas selecionadas manualmente para o treinamento
-SELECTED_FEATURES = [
+COLUNAS_SELECIONADAS = [
     "_AGE_G",
     "EDUCA",
     "MARITAL",
@@ -85,28 +85,28 @@ SELECTED_FEATURES = [
 ]
 
 # Subconjunto tratado como numérico contínuo dentro das features selecionadas
-NUMERIC_SELECTED = {"MENTHLTH", "PHYSHLTH", "CHILDREN"}
+COLUNAS_NUMERICAS = {"MENTHLTH", "PHYSHLTH", "CHILDREN"}
 
 
 # ==========================
 # Funções auxiliares
 # ==========================
-def read_dataset(csv_path: str) -> pd.DataFrame:
-    if not os.path.exists(csv_path):
+def carregar_dataset(caminho_csv: str) -> pd.DataFrame:
+    if not os.path.exists(caminho_csv):
         raise FileNotFoundError(
-            f"Arquivo não encontrado: {csv_path}. Coloque o BRFSS 2015 em 'data/2015.csv'."
+            f"Arquivo não encontrado: {caminho_csv}. Coloque o BRFSS 2015 em 'data/2015.csv'."
         )
-    return pd.read_csv(csv_path, low_memory=False)
+    return pd.read_csv(caminho_csv, low_memory=False)
 
 
-def build_missing_map(df: pd.DataFrame) -> Dict[str, Set[Any]]:
+def construir_mapa_ausentes(df: pd.DataFrame) -> Dict[str, Set[Any]]:
     """
     Constrói um mapa coluna->conjunto de códigos a serem tratados como ausentes (NaN).
 
     Heurística segura por coluna: adiciona aos ausentes somente os códigos
     clássicos que existirem naquela coluna (e.g. {7,9,77,88,99,555,777,888,999}).
     """
-    missing_map: Dict[str, Set[Any]] = {c: set() for c in df.columns}
+    mapa_ausentes: Dict[str, Set[Any]] = {c: set() for c in df.columns}
 
     classic_codes = {7, 9, 77, 88, 99, 555, 777, 888, 999}
     classic_str = {str(x) for x in classic_codes}
@@ -119,16 +119,16 @@ def build_missing_map(df: pd.DataFrame) -> Dict[str, Set[Any]]:
 
         for code in classic_codes:
             if code in uniques:
-                missing_map[col].add(code)
+                mapa_ausentes[col].add(code)
         for code in classic_str:
             if code in uniques:
-                missing_map[col].add(code)
+                mapa_ausentes[col].add(code)
 
-    return missing_map
+    return mapa_ausentes
 
 
-def apply_missing_map(df: pd.DataFrame, missing_map: Dict[str, Set[Any]]) -> pd.DataFrame:
-    for col, codes in missing_map.items():
+def aplicar_mapa_ausentes(df: pd.DataFrame, mapa_ausentes: Dict[str, Set[Any]]) -> pd.DataFrame:
+    for col, codes in mapa_ausentes.items():
         if not codes:
             continue
         try:
@@ -143,9 +143,8 @@ def apply_missing_map(df: pd.DataFrame, missing_map: Dict[str, Set[Any]]) -> pd.
     return df
 
 
-def apply_manual_cleaning(df: pd.DataFrame) -> pd.DataFrame:
-
-#Limpeza manual conforme análise dos metadados e PDF
+def aplicar_limpeza_manual(df: pd.DataFrame) -> pd.DataFrame:
+    # Limpeza manual conforme análise dos metadados e documentação
     replacements: Dict[str, Dict[Any, Any]] = {
         "_RFDRHV5": {9: np.nan},
         "_SMOKER3": {9: np.nan},
@@ -163,16 +162,16 @@ def apply_manual_cleaning(df: pd.DataFrame) -> pd.DataFrame:
     }
 
     # Trabalhar sobre uma cópia para não alterar o DataFrame original inadvertidamente
-    df_clean = df.copy()
+    df_limpo = df.copy()
 
     for col, mapping in replacements.items():
-        if col in df_clean.columns:
-            df_clean[col] = df_clean[col].replace(mapping)
+        if col in df_limpo.columns:
+            df_limpo[col] = df_limpo[col].replace(mapping)
 
-    return df_clean
+    return df_limpo
 
 
-class IQRClipper(TransformerMixin, BaseEstimator):
+class LimitadorIQR(TransformerMixin, BaseEstimator):
     """Winsoriza valores fora do intervalo IQR multiplicado por um fator."""
 
     def __init__(self, multiplier: float = 1.5) -> None:
@@ -213,7 +212,7 @@ class IQRClipper(TransformerMixin, BaseEstimator):
 
     def transform(self, X):  # type: ignore[override]
         if self.lower_ is None or self.upper_ is None:
-            raise RuntimeError("IQRClipper deve ser ajustado antes do uso.")
+            raise RuntimeError("LimitadorIQR deve ser ajustado antes do uso.")
         X_arr = np.asarray(X, dtype=float)
         reshape_needed = False
         if X_arr.ndim == 1:
@@ -232,55 +231,61 @@ class IQRClipper(TransformerMixin, BaseEstimator):
             clipped = clipped.reshape(-1)
 
         return clipped
-def create_balanced_sample(
-    df: pd.DataFrame,
-    y: pd.Series,
-    positive_label: float = 1.0,
-    negative_label: float = 0.0,
-    per_class: int = 25000,
-    random_state: int = RANDOM_STATE,
-    holdout_ratio: float = 0.1,
+
+
+# Alias mantido para compatibilidade com pipelines antigos serializados
+IQRClipper = LimitadorIQR
+
+
+def criar_amostra_balanceada(
+    dados: pd.DataFrame,
+    alvo: pd.Series,
+    rotulo_positivo: float = 1.0,
+    rotulo_negativo: float = 0.0,
+    registros_por_classe: int = 25000,
+    semente: int = SEMENTE_ALEATORIA,
+    proporcao_holdout: float = 0.1,
 ) -> Tuple[pd.DataFrame, pd.Series, int, np.ndarray]:
     """Seleciona amostra balanceada 50/50 entre classes positiva e negativa."""
 
-    valid_mask = y.isin([positive_label, negative_label])
-    y_valid = y.loc[valid_mask]
+    mascara_valida = alvo.isin([rotulo_positivo, rotulo_negativo])
+    alvo_valido = alvo.loc[mascara_valida]
 
-    pos_idx = y_valid[y_valid == positive_label].index
-    neg_idx = y_valid[y_valid == negative_label].index
+    indices_pos = alvo_valido[alvo_valido == rotulo_positivo].index
+    indices_neg = alvo_valido[alvo_valido == rotulo_negativo].index
 
-    holdout_ratio = min(max(holdout_ratio, 0.0), 0.5)
-    holdout_pos = max(1, int(len(pos_idx) * holdout_ratio)) if len(pos_idx) > 0 else 0
-    holdout_neg = max(1, int(len(neg_idx) * holdout_ratio)) if len(neg_idx) > 0 else 0
+    proporcao_holdout = min(max(proporcao_holdout, 0.0), 0.5)
+    holdout_pos = max(1, int(len(indices_pos) * proporcao_holdout)) if len(indices_pos) > 0 else 0
+    holdout_neg = max(1, int(len(indices_neg) * proporcao_holdout)) if len(indices_neg) > 0 else 0
 
-    available_pos = len(pos_idx) - holdout_pos
-    available_neg = len(neg_idx) - holdout_neg
+    disponiveis_pos = len(indices_pos) - holdout_pos
+    disponiveis_neg = len(indices_neg) - holdout_neg
 
-    actual_per_class = min(per_class, available_pos, available_neg)
+    registros_efetivos = min(registros_por_classe, disponiveis_pos, disponiveis_neg)
 
-    if actual_per_class <= 0:
+    if registros_efetivos <= 0:
         raise ValueError(
             "Não há amostras suficientes para balanceamento: "
-            f"positivos disponíveis={len(pos_idx)}, negativos disponíveis={len(neg_idx)}, "
-            f"necessário por classe={per_class} após reservar {holdout_pos} positivos e {holdout_neg} negativos para teste."
+            f"positivos disponíveis={len(indices_pos)}, negativos disponíveis={len(indices_neg)}, "
+            f"necessário por classe={registros_por_classe} após reservar {holdout_pos} positivos e {holdout_neg} negativos para teste."
         )
 
-    rng = np.random.default_rng(random_state)
-    pos_sample = rng.choice(pos_idx, size=actual_per_class, replace=False)
-    neg_sample = rng.choice(neg_idx, size=actual_per_class, replace=False)
+    rng = np.random.default_rng(semente)
+    amostra_pos = rng.choice(indices_pos, size=registros_efetivos, replace=False)
+    amostra_neg = rng.choice(indices_neg, size=registros_efetivos, replace=False)
 
-    selected_idx = np.concatenate([pos_sample, neg_sample])
-    rng.shuffle(selected_idx)
+    indices_selecionados = np.concatenate([amostra_pos, amostra_neg])
+    rng.shuffle(indices_selecionados)
 
     return (
-        df.loc[selected_idx].copy(),
-        y.loc[selected_idx].copy(),
-        actual_per_class,
-        selected_idx,
+        dados.loc[indices_selecionados].copy(),
+        alvo.loc[indices_selecionados].copy(),
+        registros_efetivos,
+        indices_selecionados,
     )
 
 
-def derive_smoker_target(df: pd.DataFrame) -> pd.Series:
+def construir_alvo_fumante(df: pd.DataFrame) -> pd.Series:
     """
     Constrói o alvo binário de fumante atual (1 = fumante, 0 = não fumante)
     com base na coluna `_SMOKER3`. Outros códigos são convertidos para NaN.
@@ -291,21 +296,21 @@ def derive_smoker_target(df: pd.DataFrame) -> pd.Series:
         )
 
     s_smoke = pd.to_numeric(df["_SMOKER3"], errors="coerce")
-    y_smoke = pd.Series(
+    alvo_fumante = pd.Series(
         np.where(s_smoke.isin([1, 2]), 1.0, np.where(s_smoke.isin([3, 4]), 0.0, np.nan)),
         index=s_smoke.index,
     )
-    return y_smoke.astype(float)
+    return alvo_fumante.astype(float)
 
 
-def select_features(
+def selecionar_variaveis(
     df: pd.DataFrame, leakage_cols: Iterable[str] | None = None
 ) -> Tuple[List[str], List[str]]:
     """Seleciona as colunas definidas manualmente e separa tipos para o pipeline."""
 
-    available = [c for c in SELECTED_FEATURES if c in df.columns]
+    available = [c for c in COLUNAS_SELECIONADAS if c in df.columns]
 
-    missing = [c for c in SELECTED_FEATURES if c not in df.columns]
+    missing = [c for c in COLUNAS_SELECIONADAS if c not in df.columns]
     if missing:
         warnings.warn(
             "As seguintes colunas selecionadas não estão presentes no dataset e serão ignoradas: "
@@ -323,7 +328,7 @@ def select_features(
     num_cols: List[str] = []
 
     for c in features:
-        if c in NUMERIC_SELECTED:
+        if c in COLUNAS_NUMERICAS:
             num_cols.append(c)
         else:
             # Demais tratadas como categóricas (incluindo codificadas numericamente)
@@ -332,7 +337,7 @@ def select_features(
     return cat_cols, num_cols
 
 
-def prepare_smoker_dataset(
+def preparar_dados_fumante(
     df: pd.DataFrame,
 ) -> Tuple[pd.DataFrame, pd.Series, List[str], List[str]]:
     """
@@ -342,22 +347,22 @@ def prepare_smoker_dataset(
     - Constrói o alvo `_SMOKER3` (binário)
     - Remove linhas com qualquer NaN em features ou target
     """
-    y_smoke = derive_smoker_target(df)
-    cat_cols, num_cols = select_features(df, leakage_cols=["_SMOKER3"])
-    feature_cols = cat_cols + num_cols
+    alvo_fumante = construir_alvo_fumante(df)
+    colunas_categoricas, colunas_numericas = selecionar_variaveis(df, leakage_cols=["_SMOKER3"])
+    colunas_caracteristicas = colunas_categoricas + colunas_numericas
 
-    if not feature_cols:
+    if not colunas_caracteristicas:
         raise RuntimeError("Nenhuma feature disponível após filtragem.")
 
-    X = df.loc[:, feature_cols].copy()
-    dataset = X.join(y_smoke.rename("target"))
+    X = df.loc[:, colunas_caracteristicas].copy()
+    dataset = X.join(alvo_fumante.rename("target"))
     dataset = dataset.dropna()
 
-    y_clean = dataset.pop("target").astype(int)
-    return dataset, y_clean, cat_cols, num_cols
+    y_limpo = dataset.pop("target").astype(int)
+    return dataset, y_limpo, colunas_categoricas, colunas_numericas
 
 
-def build_preprocess(cat_cols: List[str], num_cols: List[str]) -> compose.ColumnTransformer:
+def montar_preprocessamento(colunas_categoricas: List[str], colunas_numericas: List[str]) -> compose.ColumnTransformer:
     # Compatibilidade com versões do scikit-learn: 'sparse' foi substituído por 'sparse_output'.
     try:
         ohe = skprep.OneHotEncoder(handle_unknown="ignore", sparse_output=False)
@@ -375,33 +380,33 @@ def build_preprocess(cat_cols: List[str], num_cols: List[str]) -> compose.Column
     num_pipe = Pipeline(
         steps=[
             ("imputer", impute.SimpleImputer(strategy="median")),
-            ("clipper", IQRClipper()),
+            ("clipper", LimitadorIQR()),
             ("scaler", skprep.StandardScaler()),
         ]
     )
 
-    preprocess = compose.ColumnTransformer(
+    preprocessador = compose.ColumnTransformer(
         transformers=[
-            ("cat", cat_pipe, cat_cols),
-            ("num", num_pipe, num_cols),
+            ("cat", cat_pipe, colunas_categoricas),
+            ("num", num_pipe, colunas_numericas),
         ]
     )
-    return preprocess
+    return preprocessador
 
 
-def get_models(mode: str = "full") -> Dict[str, Any]:
-    mode = (mode or "full").lower()
-    if mode == "quick":
+def obter_modelos(modo: str = "full") -> Dict[str, Any]:
+    modo = (modo or "full").lower()
+    if modo == "quick":
         return {
             "RF": ensemble.RandomForestClassifier(
                 n_estimators=200,
                 max_depth=20,
                 max_features="sqrt",
                 class_weight="balanced_subsample",
-                random_state=RANDOM_STATE,
+                random_state=SEMENTE_ALEATORIA,
                 n_jobs=-1,
             ),
-            "GB": ensemble.GradientBoostingClassifier(random_state=RANDOM_STATE),
+            "GB": ensemble.GradientBoostingClassifier(random_state=SEMENTE_ALEATORIA),
         }
     return {
         "RF": ensemble.RandomForestClassifier(
@@ -409,165 +414,165 @@ def get_models(mode: str = "full") -> Dict[str, Any]:
             max_depth=25,
             max_features="sqrt",
             class_weight="balanced_subsample",
-            random_state=RANDOM_STATE,
+            random_state=SEMENTE_ALEATORIA,
             n_jobs=-1,
         ),
-        "GB": ensemble.GradientBoostingClassifier(random_state=RANDOM_STATE),
+        "GB": ensemble.GradientBoostingClassifier(random_state=SEMENTE_ALEATORIA),
     }
 
 
-def fit_and_evaluate(
-    df: pd.DataFrame,
-    y: pd.Series,
-    preprocess: compose.ColumnTransformer,
-    cat_cols: List[str],
-    num_cols: List[str],
-    target_name: str,
-    models: Dict[str, Any],
-    test_size: float | int = 0.15,
-    val_fraction_within_train: float = 15 / 85,
-    external_X_test: pd.DataFrame | None = None,
-    external_y_test: pd.Series | None = None,
+def treinar_e_avaliar(
+    dados: pd.DataFrame,
+    alvo: pd.Series,
+    preprocessador: compose.ColumnTransformer,
+    colunas_categoricas: List[str],
+    colunas_numericas: List[str],
+    nome_alvo: str,
+    modelos: Dict[str, Any],
+    tamanho_teste: float | int = 0.15,
+    fracao_validacao_no_treino: float = 15 / 85,
+    teste_externo_X: pd.DataFrame | None = None,
+    teste_externo_y: pd.Series | None = None,
 ) -> Tuple[Dict[str, Dict[str, float]], Tuple[str, float, Pipeline]]:
     """
-    - Filtra linhas com y ausente
-    - Split estratificado conforme parâmetros (test_size pode ser fração ou inteiro)
-    - Treina e avalia modelos, devolve resultados e o melhor selecionado por Val Accuracy
-      (Test Accuracy reportado após ajuste final; se external_X_test estiver definido, usa-o)
+    - Filtra registros com alvo ausente.
+    - Realiza splits estratificados conforme os parâmetros informados.
+    - Treina e avalia os modelos, retornando o resumo completo e o melhor pipeline
+      (Accuracy de teste interno ou externo reportado após o ajuste final).
     """
     # Filtrar apenas registros com y válido
-    feature_cols = cat_cols + num_cols
-    mask = y.notna()
-    df_ = df.loc[mask, feature_cols].copy()
-    y_ = y.loc[mask].astype(int)
+    colunas_modelo = colunas_categoricas + colunas_numericas
+    mask = alvo.notna()
+    dados_validos = dados.loc[mask, colunas_modelo].copy()
+    alvo_valido = alvo.loc[mask].astype(int)
     removed_rows = int((~mask).sum())
 
-    log(f"Linhas com target ausente removidas para {target_name}: {removed_rows}.")
+    log(f"Linhas com target ausente removidas para {nome_alvo}: {removed_rows}.")
 
     X_train_val, X_test, y_train_val, y_test = skms.train_test_split(
-        df_, y_, test_size=test_size, stratify=y_, random_state=RANDOM_STATE
+        dados_validos, alvo_valido, test_size=tamanho_teste, stratify=alvo_valido, random_state=SEMENTE_ALEATORIA
     )
 
-    if not 0 < val_fraction_within_train < 1:
-        raise ValueError("val_fraction_within_train deve estar entre 0 e 1.")
+    if not 0 < fracao_validacao_no_treino < 1:
+        raise ValueError("fracao_validacao_no_treino deve estar entre 0 e 1.")
 
     X_train, X_val, y_train, y_val = skms.train_test_split(
         X_train_val,
         y_train_val,
-        test_size=val_fraction_within_train,
+        test_size=fracao_validacao_no_treino,
         stratify=y_train_val,
-        random_state=RANDOM_STATE,
+        random_state=SEMENTE_ALEATORIA,
     )
 
     log(
-        f"Split estratificado definido para {target_name}: "
+        f"Split estratificado definido para {nome_alvo}: "
         f"treino={len(X_train)}, val={len(X_val)}, teste={len(X_test)}."
     )
 
     # Resultados
-    results: Dict[str, Dict[str, float]] = {}
-    best_name: str | None = None
-    best_val_acc = -np.inf
+    resultados_modelo: Dict[str, Dict[str, float]] = {}
+    melhor_modelo: str | None = None
+    melhor_acc_validacao = -np.inf
 
-    for name, model in models.items():
+    for nome_modelo, estimador in modelos.items():
         pipe = Pipeline(
-            steps=[("prep", clone(preprocess)), ("clf", clone(model))]
+            steps=[("prep", clone(preprocessador)), ("clf", clone(estimador))]
         )
 
         pipe.fit(X_train, y_train)
         val_pred = pipe.predict(X_val)
         val_acc = metrics.accuracy_score(y_val, val_pred)
 
-        results[name] = {
+        resultados_modelo[nome_modelo] = {
             "val_acc": float(val_acc),
             "test_acc": np.nan,
             "test_auc": np.nan,
         }
 
         print(
-            f"Modelo={name} | Alvo={target_name.upper()} | Val Accuracy={val_acc*100:.2f}%"
+            f"Modelo={nome_modelo} | Alvo={nome_alvo.upper()} | Val Accuracy={val_acc*100:.2f}%"
         )
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_name = name
+        if val_acc > melhor_acc_validacao:
+            melhor_acc_validacao = val_acc
+            melhor_modelo = nome_modelo
 
-    if best_name is None:
+    if melhor_modelo is None:
         raise RuntimeError("Não foi possível selecionar o melhor modelo.")
 
     log(
-        f"Reajustando o modelo {best_name} com dados de treino+validação para {target_name}."
+        f"Reajustando o modelo {melhor_modelo} com dados de treino+validação para {nome_alvo}."
     )
-    final_pipe = Pipeline(
-        steps=[("prep", clone(preprocess)), ("clf", clone(models[best_name]))]
+    pipeline_final = Pipeline(
+        steps=[("prep", clone(preprocessador)), ("clf", clone(modelos[melhor_modelo]))]
     )
-    final_pipe.fit(X_train_val, y_train_val)
+    pipeline_final.fit(X_train_val, y_train_val)
 
-    eval_X = X_test
-    eval_y = y_test
-    eval_desc = "teste interno estratificado"
-    if external_X_test is not None and external_y_test is not None:
-        eval_X = external_X_test
-        eval_y = external_y_test
-        eval_desc = "teste externo"
+    X_avaliacao = X_test
+    y_avaliacao = y_test
+    descricao_avaliacao = "teste interno estratificado"
+    if teste_externo_X is not None and teste_externo_y is not None:
+        X_avaliacao = teste_externo_X
+        y_avaliacao = teste_externo_y
+        descricao_avaliacao = "teste externo"
         log(
-            f"Executando avaliação externa para {target_name} com {len(eval_X)} registros."
+            f"Executando avaliação externa para {nome_alvo} com {len(X_avaliacao)} registros."
         )
 
-    final_test_pred = final_pipe.predict(eval_X)
+    predicoes_teste = pipeline_final.predict(X_avaliacao)
     try:
-        final_test_scores = proba_or_score(final_pipe, eval_X)
+        scores_teste = probabilidades_ou_scores(pipeline_final, X_avaliacao)
     except Exception:
-        final_test_scores = None
+        scores_teste = None
 
-    metric_summary = classification_metrics(
-        eval_y, final_test_pred, scores=final_test_scores
+    resumo_metricas = metricas_classificacao(
+        y_avaliacao, predicoes_teste, scores=scores_teste
     )
 
-    final_test_acc = metric_summary["accuracy"]
-    final_test_auc = metric_summary["roc_auc"]
+    acuracia_teste = resumo_metricas["accuracy"]
+    auc_teste = resumo_metricas["roc_auc"]
 
-    results[best_name]["test_acc"] = final_test_acc
-    results[best_name]["test_auc"] = final_test_auc
-    results[best_name]["confusion_matrix"] = metric_summary["confusion_matrix"]
-    results[best_name]["precision"] = metric_summary["precision"]
-    results[best_name]["recall"] = metric_summary["recall"]
-    results[best_name]["specificity"] = metric_summary["specificity"]
-    results[best_name]["f1"] = metric_summary["f1"]
+    resultados_modelo[melhor_modelo]["test_acc"] = acuracia_teste
+    resultados_modelo[melhor_modelo]["test_auc"] = auc_teste
+    resultados_modelo[melhor_modelo]["confusion_matrix"] = resumo_metricas["confusion_matrix"]
+    resultados_modelo[melhor_modelo]["precision"] = resumo_metricas["precision"]
+    resultados_modelo[melhor_modelo]["recall"] = resumo_metricas["recall"]
+    resultados_modelo[melhor_modelo]["specificity"] = resumo_metricas["specificity"]
+    resultados_modelo[melhor_modelo]["f1"] = resumo_metricas["f1"]
 
-    feature_cols = cat_cols + num_cols
-    feature_summary: List[Tuple[str, float]] | None = None
-    if eval_X is not None and len(eval_X) > 0:
+    colunas_caracteristicas = colunas_modelo
+    importancias_ordenadas: List[Tuple[str, float]] | None = None
+    if X_avaliacao is not None and len(X_avaliacao) > 0:
         try:
-            pi_result = permutation_importance(
-                final_pipe,
-                eval_X,
-                eval_y,
+            resultado_permutacao = permutation_importance(
+                pipeline_final,
+                X_avaliacao,
+                y_avaliacao,
                 n_repeats=10,
-                random_state=RANDOM_STATE,
+                random_state=SEMENTE_ALEATORIA,
                 n_jobs=-1,
             )
-            importances = pi_result.importances_mean
-            feature_summary = sorted(
+            importancias = resultado_permutacao.importancias_mean
+            importancias_ordenadas = sorted(
                 [
-                    (feature_cols[idx], float(importances[idx]))
-                    for idx in range(len(feature_cols))
+                    (colunas_caracteristicas[idx], float(importancias[idx]))
+                    for idx in range(len(colunas_caracteristicas))
                 ],
                 key=lambda item: abs(item[1]),
                 reverse=True,
             )
         except Exception:
-            feature_summary = None
+            importancias_ordenadas = None
 
-    results[best_name]["feature_importances"] = feature_summary or []
+    resultados_modelo[melhor_modelo]["feature_importances"] = importancias_ordenadas or []
 
     print(
-        f"Modelo selecionado (validação)={best_name} | Alvo={target_name.upper()} | "
-        f"Val Accuracy={best_val_acc*100:.2f}% | {eval_desc.title()} Accuracy={final_test_acc*100:.2f}% | "
-        f"{eval_desc.title()} ROC-AUC={(final_test_auc*100 if not np.isnan(final_test_auc) else np.nan):.2f}"
+        f"Modelo selecionado (validação)={melhor_modelo} | Alvo={nome_alvo.upper()} | "
+        f"Val Accuracy={melhor_acc_validacao*100:.2f}% | {descricao_avaliacao.title()} Accuracy={acuracia_teste*100:.2f}% | "
+        f"{descricao_avaliacao.title()} ROC-AUC={(auc_teste*100 if not np.isnan(auc_teste) else np.nan):.2f}"
     )
 
-    return results, (best_name, float(final_test_acc), final_pipe)
+    return resultados_modelo, (melhor_modelo, float(acuracia_teste), pipeline_final)
 
 
 def main() -> None:
@@ -594,64 +599,64 @@ def main() -> None:
     args = parser.parse_args()
 
     log("Carregando dataset BRFSS 2015…")
-    df = read_dataset(args.dataset)
+    df = carregar_dataset(args.dataset)
     if args.sample is not None and args.sample > 0 and args.sample < len(df):
         log(f"Amostrando {args.sample} linhas do dataset para execução rápida…")
-        df = df.sample(n=args.sample, random_state=RANDOM_STATE)
+        df = df.sample(n=args.sample, random_state=SEMENTE_ALEATORIA)
 
-    required_cols = sorted(set(SELECTED_FEATURES + ["_SMOKER3"]))
-    missing_cols = [col for col in required_cols if col not in df.columns]
-    if missing_cols:
+    colunas_necessarias = sorted(set(COLUNAS_SELECIONADAS + ["_SMOKER3"]))
+    colunas_faltantes = [col for col in colunas_necessarias if col not in df.columns]
+    if colunas_faltantes:
         raise ValueError(
             "O dataset não contém as colunas necessárias para o treinamento: "
-            + ", ".join(missing_cols)
+            + ", ".join(colunas_faltantes)
         )
 
     # Garantir que somente as colunas necessárias sejam utilizadas
-    df = df.loc[:, required_cols]
+    df = df.loc[:, colunas_necessarias]
 
     log("Aplicando limpeza manual nas colunas selecionadas…")
-    df = apply_manual_cleaning(df)
+    df = aplicar_limpeza_manual(df)
 
     # Construir e aplicar mapa de ausentes (heurística por coluna)
     log("Mapeando códigos de não resposta por coluna (heurística segura)…")
-    missing_map = build_missing_map(df)
-    df = apply_missing_map(df, missing_map)
+    mapa_ausentes = construir_mapa_ausentes(df)
+    df = aplicar_mapa_ausentes(df, mapa_ausentes)
     log("Ausentes tratados respeitando a especificidade por coluna (heurística).")
 
     log("Preparando dataset limpo para o alvo fumante atual…")
-    X_full, y_full, cat_cols, num_cols = prepare_smoker_dataset(df)
+    X_full, y_full, cat_cols, num_cols = preparar_dados_fumante(df)
     total = len(y_full)
-    positives = int((y_full == 1).sum())
-    negatives = int((y_full == 0).sum())
+    total_fumantes = int((y_full == 1).sum())
+    total_nao_fumantes = int((y_full == 0).sum())
     log(
         f"Após limpeza, restaram {total} registros válidos "
-        f"({positives} fumantes, {negatives} não fumantes)."
+        f"({total_fumantes} fumantes, {total_nao_fumantes} não fumantes)."
     )
 
     log("Balanceando o dataset (50/50) via subamostragem estratificada…")
-    X_bal, y_bal, actual_per_class, selected_idx = create_balanced_sample(
+    X_bal, y_bal, registros_balanceados, indices_selecionados = criar_amostra_balanceada(
         X_full,
         y_full,
-        positive_label=1.0,
-        negative_label=0.0,
-        per_class=args.balance_per_class,
-        random_state=RANDOM_STATE,
-        holdout_ratio=args.balance_holdout,
+        rotulo_positivo=1.0,
+        rotulo_negativo=0.0,
+        registros_por_classe=args.balance_per_class,
+        semente=SEMENTE_ALEATORIA,
+        proporcao_holdout=args.balance_holdout,
     )
     log(
-        f"Amostra balanceada contém {len(X_bal)} registros ({actual_per_class} por classe)."
+        f"Amostra balanceada contém {len(X_bal)} registros ({registros_balanceados} por classe)."
     )
 
-    selected_idx = pd.Index(selected_idx)
-    remaining_idx = y_full.index.difference(selected_idx)
-    external_X: pd.DataFrame | None = None
-    external_y: pd.Series | None = None
-    if args.balance_holdout > 0 and not remaining_idx.empty:
-        external_X = X_full.loc[remaining_idx].copy()
-        external_y = y_full.loc[remaining_idx].copy()
+    indices_selecionados = pd.Index(indices_selecionados)
+    indices_restantes = y_full.index.difference(indices_selecionados)
+    X_externo: pd.DataFrame | None = None
+    y_externo: pd.Series | None = None
+    if args.balance_holdout > 0 and not indices_restantes.empty:
+        X_externo = X_full.loc[indices_restantes].copy()
+        y_externo = y_full.loc[indices_restantes].copy()
         log(
-            f"Teste externo utilizará {len(external_X)} registros remanescentes sem sobreposição com a amostra balanceada."
+            f"Teste externo utilizará {len(X_externo)} registros remanescentes sem sobreposição com a amostra balanceada."
         )
     else:
         log("Sem amostra remanescente suficiente para teste externo; usando apenas teste interno estratificado.")
@@ -659,69 +664,69 @@ def main() -> None:
     log(
         "Montando pipeline de pré-processamento (imputação + clipping IQR + one-hot + padronização)…"
     )
-    preprocess = build_preprocess(cat_cols, num_cols)
+    preprocessador = montar_preprocessamento(cat_cols, num_cols)
 
-    models = get_models("quick" if args.quick else "full")
+    modelos = obter_modelos("quick" if args.quick else "full")
 
     log("Treinando e avaliando modelos para o alvo Fumante atual…")
-    smoke_results, (best_name, best_acc, best_pipe) = fit_and_evaluate(
+    resultados, (melhor_nome, melhor_acc, melhor_pipeline) = treinar_e_avaliar(
         X_bal,
         y_bal,
-        preprocess,
+        preprocessador,
         cat_cols,
         num_cols,
-        target_name="Fumante atual",
-        models=models,
-        external_X_test=external_X,
-        external_y_test=external_y,
+        nome_alvo="Fumante atual",
+        modelos=modelos,
+        teste_externo_X=X_externo,
+        teste_externo_y=y_externo,
     )
 
     log("Treinamento concluído.")
 
     log("Salvando pipeline treinado em models/smoker_current_model.joblib…")
     os.makedirs("models", exist_ok=True)
-    dump(best_pipe, os.path.join("models", "smoker_current_model.joblib"))
+    dump(melhor_pipeline, os.path.join("models", "smoker_current_model.joblib"))
 
     print("\n========== RESULTADOS ==========")
 
     print("\n>> FUMANTE ATUAL")
     print("  Modelos avaliados:")
-    for name in sorted(smoke_results.keys()):
-        metrics_map = smoke_results[name]
+    for nome_modelo in sorted(resultados.keys()):
+        metrics_map = resultados[nome_modelo]
         val_txt = _fmt_pct(metrics_map.get("val_acc"))
         test_txt = _fmt_pct(metrics_map.get("test_acc"))
         auc_txt = _fmt_pct(metrics_map.get("test_auc"))
-        print(f"    - {name:<30} | Val={val_txt:<8} Test={test_txt:<8} ROC-AUC={auc_txt:<8}")
+        print(f"    - {nome_modelo:<30} | Val={val_txt:<8} Test={test_txt:<8} ROC-AUC={auc_txt:<8}")
 
-    best_metrics = smoke_results[best_name]
-    print(f"\n  Melhor modelo: {best_name}")
+    metricas_melhor_modelo = resultados[melhor_nome]
+    print(f"\n  Melhor modelo: {melhor_nome}")
     print(
         "    → Val={val} | Test={test} | ROC-AUC={auc}"
         .format(
-            val=_fmt_pct(best_metrics.get("val_acc")),
-            test=_fmt_pct(best_metrics.get("test_acc")),
-            auc=_fmt_pct(best_metrics.get("test_auc")),
+            val=_fmt_pct(metricas_melhor_modelo.get("val_acc")),
+            test=_fmt_pct(metricas_melhor_modelo.get("test_acc")),
+            auc=_fmt_pct(metricas_melhor_modelo.get("test_auc")),
         )
     )
 
-    _print_confusion_matrix(best_metrics.get("confusion_matrix", []))
+    _print_confusion_matrix(metricas_melhor_modelo.get("confusion_matrix", []))
 
     print(
         "    Métricas complementares: Precisão={p:.3f} | Recall={r:.3f} | "
         "Especificidade={s:.3f} | F1={f:.3f}"
         .format(
-            p=best_metrics.get("precision", float("nan")),
-            r=best_metrics.get("recall", float("nan")),
-            s=best_metrics.get("specificity", float("nan")),
-            f=best_metrics.get("f1", float("nan")),
+            p=metricas_melhor_modelo.get("precision", float("nan")),
+            r=metricas_melhor_modelo.get("recall", float("nan")),
+            s=metricas_melhor_modelo.get("specificity", float("nan")),
+            f=metricas_melhor_modelo.get("f1", float("nan")),
         )
     )
 
-    feature_summary = best_metrics.get("feature_importances")
-    if feature_summary:
-        print("\n  Principais variáveis associadas ao tabagismo (permutation importance):")
-        for rank, (feat, importance) in enumerate(feature_summary[:10], start=1):
-            print(f"    {rank:>2}. {feat:<30} Δ={importance:.5f}")
+    importancias_ordenadas = metricas_melhor_modelo.get("feature_importances")
+    if importancias_ordenadas:
+        print("\n  Principais variáveis associadas ao tabagismo (importância por permutação):")
+        for rank, (variavel, importancia) in enumerate(importancias_ordenadas[:10], start=1):
+            print(f"    {rank:>2}. {variavel:<30} Δ={importancia:.5f}")
     else:
         print("\n  Não foi possível calcular importâncias de features.")
 
