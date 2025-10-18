@@ -43,6 +43,22 @@ def _divisao_segura(numerator: float, denominator: float) -> float:
     return float(numerator / denominator) if denominator else float("nan")
 
 
+def formatar_percentual(valor: float | None) -> str:
+    """
+    Formata valores decimais em percentual (00.00%).
+    Retorna "--" para valores nulos ou NaN.
+    """
+    if valor is None:
+        return "--"
+    try:
+        if np.isnan(valor):
+            return "--"
+    except TypeError:
+        # Para tipos que não suportam np.isnan (como objetos), retorna string padrão
+        return "--"
+    return f"{valor * 100:.2f}%"
+
+
 def metricas_classificacao(
     y_true: Iterable[Any],
     y_pred: Iterable[Any],

@@ -3,8 +3,8 @@
 Este projeto treina e avalia um modelo de classificação binária para identificar
 fumantes atuais (`_SMOKER3`) no BRFSS 2015. O pipeline aplica limpeza específica
 por coluna, trata códigos de não resposta, remove linhas com valores ausentes,
-balanceia o conjunto 50/50 entre fumantes e não fumantes e treina diferentes
-classificadores. O melhor modelo é salvo como um pipeline do scikit-learn pronto
+balanceia o conjunto 50/50 entre fumantes e não fumantes e treina uma árvore
+de decisão. O melhor modelo é salvo como um pipeline do scikit-learn pronto
 para inferência, juntamente com métricas e importâncias de variáveis.
 
 ## Requisitos
@@ -44,7 +44,7 @@ Durante o treinamento:
 
 1. Linhas com valores ausentes no alvo ou nas features são removidas.
 2. O dataset é balanceado para garantir a mesma quantidade de fumantes e não fumantes.
-3. Dois classificadores supervisionados (`RandomForestClassifier` e `GradientBoostingClassifier`) são avaliados e o melhor (pela validação interna) é ajustado em treino+validação.
+3. Um classificador `DecisionTreeClassifier` é ajustado, usando variações de parâmetros quando a flag `--quick` é habilitada.
 4. O desempenho final é reportado (teste interno e opcionalmente externo) com métricas, matriz de confusão e importâncias de variáveis (permutation importance).
 
 O artefato treinado é salvo em:
@@ -65,6 +65,12 @@ Argumentos:
 - `--models-dir DIR` — diretório contendo o `.joblib` treinado.
 
 O script imprime métricas (Accuracy, ROC-AUC, Precisão, Recall, Especificidade e F1) e a matriz de confusão.
+
+## Interpretação
+
+- A lista das variáveis que mais influenciam o modelo é impressa ao final do treinamento, no bloco “Principais variáveis associadas ao tabagismo (importância por permutação)”.
+- Caso deseje recalcular após ajustes, carregue o pipeline salvo (`models/smoker_current_model.joblib`) e execute `sklearn.inspection.permutation_importance` com o conjunto de validação desejado.
+- A limpeza manual e a heurística de códigos ausentes permanecem centralizadas nas funções `aplicar_limpeza_manual` e `construir_mapa_ausentes`, garantindo que os mesmos tratamentos sejam aplicados em treinamento, avaliação e análises exploratórias.
 
 ## Estrutura
 
