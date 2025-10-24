@@ -533,6 +533,7 @@ def treinar_e_avaliar(
     resultados_modelo[melhor_modelo]["precision"] = resumo_metricas["precision"]
     resultados_modelo[melhor_modelo]["recall"] = resumo_metricas["recall"]
     resultados_modelo[melhor_modelo]["specificity"] = resumo_metricas["specificity"]
+    resultados_modelo[melhor_modelo]["false_positive_rate"] = resumo_metricas["false_positive_rate"]
     resultados_modelo[melhor_modelo]["f1"] = resumo_metricas["f1"]
 
     colunas_caracteristicas = colunas_modelo
@@ -710,16 +711,8 @@ def main() -> None:
 
     _print_confusion_matrix(metricas_melhor_modelo.get("confusion_matrix", []))
 
-    print(
-        "    Métricas complementares: Precisão={p:.3f} | Recall={r:.3f} | "
-        "Especificidade={s:.3f} | F1={f:.3f}"
-        .format(
-            p=metricas_melhor_modelo.get("precision", float("nan")),
-            r=metricas_melhor_modelo.get("recall", float("nan")),
-            s=metricas_melhor_modelo.get("specificity", float("nan")),
-            f=metricas_melhor_modelo.get("f1", float("nan")),
-        )
-    )
+    fpr = metricas_melhor_modelo.get("false_positive_rate", float("nan"))
+    print(f"    Taxa de falsos positivos (FPR)={fpr:.3f}")
 
     importancias_ordenadas = metricas_melhor_modelo.get("feature_importances")
     if importancias_ordenadas:

@@ -98,6 +98,7 @@ def metricas_classificacao(
     precision = _divisao_segura(tp, tp + fp)
     recall = _divisao_segura(tp, tp + fn)
     specificity = _divisao_segura(tn, tn + fp)
+    false_positive_rate = _divisao_segura(fp, fp + tn)
     f1 = _divisao_segura(2 * tp, 2 * tp + fp + fn)
 
     return {
@@ -110,5 +111,6 @@ def metricas_classificacao(
         "precision": float(precision),
         "recall": float(recall),
         "specificity": float(specificity),
+        "false_positive_rate": float(false_positive_rate),
         "f1": float(f1),
     }

@@ -21,7 +21,6 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
-import numpy as np
 import pandas as pd
 from joblib import load
 
@@ -126,10 +125,10 @@ def main() -> None:
 
     print("\n== FUMANTE ATUAL ==")
     print(f"Amostras avaliadas: {resultado['n']}")
+    fpr = resultado.get("false_positive_rate", float("nan"))
     print(
         f"Accuracy={formatar_percentual(resultado['accuracy'])} | ROC-AUC={formatar_percentual(resultado['roc_auc'])} | "
-        f"Precisão={resultado['precision']:.3f} | Recall={resultado['recall']:.3f} | "
-        f"Especificidade={resultado['specificity']:.3f} | F1={resultado['f1']:.3f}"
+        f"Taxa de falsos positivos (FPR)={fpr:.3f}"
     )
     print("Matriz de confusão [real 0/1 x prev 0/1]:")
     cm = resultado["confusion_matrix"]
